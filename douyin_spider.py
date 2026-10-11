@@ -41,6 +41,7 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 API_POST = "/aweme/v1/web/aweme/post/"            # 用户作品列表接口
 API_PROFILE = "/aweme/v1/web/user/profile/other/"  # 用户资料接口
 API_DETAIL = "/aweme/v1/web/aweme/detail/"         # 单视频详情接口
+API_SEARCH = "/aweme/v1/web/search/item/"          # 搜索接口
 API_COMMENT = "/aweme/v1/web/comment/list/"        # 评论接口（含回复列表 /reply/）
 
 CAPTCHA_KEYWORDS = ("验证码", "安全验证", "拖动滑块", "滑动验证")
@@ -264,6 +265,20 @@ class DouyinSpider:
                              or aw["aweme_id"] == self.expect_vid)):
                     self.works[aw["aweme_id"]] = aw
                     self.has_more = False
+                    self._last_post_resp = time.time()
+            elif API_SEARCH in url:
+                # 搜索结果页的卡片里混着直播/商品等推广卡，
+                # 只收带可下载视频地址的条目
+                data = resp.json()
+                new_cnt = 0
+                for card in data.get("data") or []:
+                    aw = (card or {}).get("aweme_info") or {}
+                    awid = aw.get("aweme_id")
+                    if (awid and awid not in self.works
+                            and (aw.get("video") or {}).get("play_addr", {}).get("url_list")):
+                        self.works[awid] = aw
+                        new_cnt += 1
+                if new_cnt:
                     self._last_post_resp = time.time()
             elif API_COMMENT in url:
                 self._pending_comment_resps.append(resp)
@@ -777,6 +792,67 @@ class DouyinSpider:
         finally:
             self.stop_browser()
 
+    # ---------- 关键词搜索模式 ----------
+
+    def run_search(self, query):
+        """关键词搜索模式。
+
+        工作方式：打开搜索结果页自动滚动收集，结果页卡片里混着直播/商品等
+        推广卡，只收带可下载视频地址的条目。
+        重要：搜索页大概率触发平台安全验证（点选/滑块），脚本不会也无法
+        自动绕过——检测到验证会停下等待，请在弹出的浏览器窗口里手动完成，
+        脚本检测到验证解除后自动继续收集。
+        """
+        self.outdir.mkdir(parents=True, exist_ok=True)
+        self.start_browser()
+        try:
+            url = f"https://www.douyin.com/search/{quote(query)}?type=video"
+            log(f"打开搜索页: {url}")
+            log("搜索模式：若浏览器里弹出安全验证，请手动完成，"
+                "脚本检测到验证解除后会自动继续")
+            self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+
+            self.user_dir = self.outdir / f"搜索_{safe_name(query, 30)}"
+            self.videos_dir = self.user_dir / "videos"
+            self.images_dir = self.user_dir / "images"
+            self.videos_dir.mkdir(parents=True, exist_ok=True)
+            self.images_dir.mkdir(parents=True, exist_ok=True)
+
+            self._last_post_resp = time.time()
+            last_n = -1
+            stable = 0
+            while True:
+                if self.limit and len(self.works) >= self.limit:
+                    log(f"已达 --limit {self.limit}，停止收集")
+                    break
+                self._check_captcha()
+                n = len(self.works)
+                if n == last_n:
+                    stable += 1
+                    if stable >= 8:  # 连续约 16 秒无新数据：加载完了
+                        break
+                else:
+                    stable = 0
+                    last_n = n
+                    log(f"已收集 {n} 个搜索结果...")
+                # 真实鼠标滚轮滚动加载更多（与探测脚本同款，实测有效）
+                self._page.mouse.move(800, 450)
+                self._page.mouse.wheel(0, random.uniform(900, 1600))
+                time.sleep(random.uniform(1.5, 2.5))
+
+            if not self.works:
+                log("搜索结果一条都没收到。可能：验证未完成 / cookies 失效 / 关键词无结果")
+                return
+
+            tasks = self.build_tasks()
+            self.download_all(tasks)
+            self.save_meta(tasks)
+            log("=" * 60)
+            log(f"搜索完成！共 {len(tasks)} 个作品，保存位置: {self.user_dir}")
+            log("=" * 60)
+        finally:
+            self.stop_browser()
+
     # ---------- 视频评论抓取模式 ----------
 
     def _scroll_comment_panel(self):
@@ -919,6 +995,7 @@ def main():
     parser.add_argument("--account", help="抖音号（个人主页显示的那个号）")
     parser.add_argument("--url", help="或：用户主页链接（含 sec_uid）")
     parser.add_argument("--video", help="或：单个视频链接/分享文案")
+    parser.add_argument("--search", help="或：关键词搜索（弹验证时需在浏览器窗口手动完成）")
     parser.add_argument("--comments", help="或：抓取该视频的评论，导出 CSV（视频链接/分享文案）")
     parser.add_argument("--cookie", help="整串 cookie 字符串")
     parser.add_argument("--cookie-file", help="或：cookie 文件路径（文件里粘贴整串 cookie）")
@@ -939,9 +1016,9 @@ def main():
                 sys.exit(1)
 
     query = args.account or args.url
-    if not query and not args.video and not args.comments:
+    if not query and not args.video and not args.comments and not args.search:
         if not INTERACTIVE:
-            log("未提供 --account/--url/--video/--comments（无人值守模式无法交互输入），退出")
+            log("未提供 --account/--url/--video/--search/--comments（无人值守模式无法交互输入），退出")
             sys.exit(1)
         print("=" * 60)
         print("抖音作品爬虫")
@@ -960,7 +1037,9 @@ def main():
     spider = DouyinSpider(cookies, args.outdir, headless=args.headless,
                           limit=args.limit, since=args.since, until=args.until)
     try:
-        if args.video:
+        if args.search:
+            spider.run_search(args.search)
+        elif args.video:
             spider.run_single(args.video)
         elif args.comments:
             spider.run_comments(args.comments)

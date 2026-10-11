@@ -78,7 +78,7 @@ class Runner:
 
         query = (query or "").strip()
         if mode != "batch" and not query:
-            return "请填写目标（抖音号/主页链接/视频链接）"
+            return "请填写目标（抖音号/主页链接/视频链接/搜索关键词）"
 
         def as_int(v, name):
             try:
@@ -146,6 +146,8 @@ class Runner:
                 c = base_spider_cmd()
                 if bt == "single":
                     c += ["--video", ln]
+                elif bt == "search":
+                    c += ["--search", ln]
                 elif bt == "comments":
                     c += ["--comments", ln]
                 else:
@@ -165,6 +167,8 @@ class Runner:
                 cmd += ["--video", query]
             elif mode == "comments":
                 cmd += ["--comments", query]
+            elif mode == "search":
+                cmd += ["--search", query]
             else:
                 flag = "--url" if ("douyin.com" in query or "MS4wLjAB" in query) else "--account"
                 cmd += [flag, query]
@@ -555,6 +559,7 @@ PAGE = """<!DOCTYPE html>
     <select id="mode" onchange="onMode()">
       <option value="user">用户作品（可按时间段）</option>
       <option value="single">单个视频</option>
+      <option value="search">关键词搜索</option>
       <option value="comments">视频评论（导出 CSV）</option>
       <option value="batch">批量任务（每行一个，依次执行）</option>
       <option value="live">直播录制</option>
@@ -562,6 +567,17 @@ PAGE = """<!DOCTYPE html>
 
     <label id="queryLabel">目标（抖音号 / 主页链接 / App 分享文案）</label>
     <input type="text" id="query" placeholder="例如：27285332742 或 https://v.douyin.com/xxxx/">
+
+    <div id="searchTip" style="display:none; margin-top:8px; padding:10px 12px;
+         border-radius:8px; background:#fff8e6; border:1px solid #ffd591;
+         font-size:13px; line-height:1.7; color:#8c6d1f">
+      <b>搜索模式工作方式（请先读一遍）：</b><br>
+      ① 点开始后会弹出浏览器，自动打开搜索结果页并滚动收集视频；<br>
+      ② 搜索页<b>大概率触发平台安全验证</b>（如点选相同图案），脚本不会也无法替你绕过——
+      它会自动暂停等待，<b>请你直接在那个弹出的浏览器窗口里手动完成验证</b>；<br>
+      ③ 完成后无需任何操作，脚本检测到验证解除会自动继续收集并下载；<br>
+      ④ 约一半概率需要手动过一次验证，属正常现象，多试几个词即可。
+    </div>
 
     <div id="dateRow" style="display:flex; gap:12px; margin-top:2px; flex-wrap:wrap;">
       <div style="flex:1; min-width:150px">
@@ -581,9 +597,10 @@ PAGE = """<!DOCTYPE html>
 
     <div id="batchRow" style="display:none">
       <label>批量类型</label>
-      <select id="batchType">
+      <select id="batchType" onchange="onMode()">
         <option value="user">用户作品（每行一个抖音号/主页链接）</option>
         <option value="single">单个视频（每行一个视频链接）</option>
+        <option value="search">关键词搜索（每行一个关键词）</option>
         <option value="comments">视频评论（每行一个视频链接）</option>
       </select>
       <label>每个任务爬取数量（留空 = 不限，全部爬完）</label>
@@ -641,6 +658,7 @@ function onMode() {
   $("dateRow").style.display = m === "user" ? "flex" : "none";
   $("liveRow").style.display = m === "live" ? "block" : "none";
   $("batchRow").style.display = m === "batch" ? "block" : "none";
+  $("searchTip").style.display = (m === "search" || (m === "batch" && $("batchType").value === "search")) ? "block" : "none";
   const isBatch = m === "batch";
   $("queryLabel").style.display = isBatch ? "none" : "block";
   $("query").style.display = isBatch ? "none" : "block";
@@ -650,6 +668,7 @@ function onMode() {
   const labels = {
     user:     ["目标（抖音号 / 主页链接 / App 分享文案）", "例如：27285332742 或 https://v.douyin.com/xxxx/", "数量限制", "全部"],
     single:   ["视频链接 / App 分享文案", "粘贴视频链接或分享文案，如 https://v.douyin.com/xxxx/", "数量限制", "1"],
+    search:   ["搜索关键词", "如：家常菜、篮球教程、旅行 vlog（若弹验证请在浏览器窗口手动完成）", "数量限制", "全部"],
     comments: ["视频链接 / App 分享文案", "粘贴视频链接，评论将导出为 CSV", "评论数量上限", "全部"],
     live:     ["直播间链接或房间号", "如 https://live.douyin.com/123456 或纯数字房间号", "录制时长（分钟，留空=不限）", "不限"],
     batch:    ["", "", "每个任务的数量限制", "全部"]
@@ -659,8 +678,8 @@ function onMode() {
   $("limitLabel").textContent = labels[2];
   $("limit").placeholder = labels[3];
   $("btnStart").textContent =
-    { user: "开始爬取", single: "开始下载", comments: "开始抓取评论",
-      batch: "开始批量任务", live: "开始录制" }[m] || "开始任务";
+    { user: "开始爬取", single: "开始下载", search: "开始搜索",
+      comments: "开始抓取评论", batch: "开始批量任务", live: "开始录制" }[m] || "开始任务";
   localStorage.setItem("dy_mode", m);
 }
 
