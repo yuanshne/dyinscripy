@@ -617,7 +617,7 @@ PAGE = """<!DOCTYPE html>
     </select>
 
     <label id="queryLabel">目标（抖音号 / 主页链接 / App 分享文案）</label>
-    <input type="text" id="query" placeholder="例如：27285332742 或 https://v.douyin.com/xxxx/">
+    <input type="text" id="query" placeholder="例如：12345678 或 https://v.douyin.com/xxxx/">
 
     <div id="sortRow" style="display:none; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap">
       <label style="margin:0">搜索结果排序</label>
@@ -670,7 +670,7 @@ PAGE = """<!DOCTYPE html>
       <label>每个任务爬取数量（留空 = 不限，全部爬完）</label>
       <input type="text" id="batchLimit" placeholder="如 10，则每个任务最多爬 10 个；留空则全部爬完">
       <label>目标列表（每行一个，最多 20 行）</label>
-      <textarea id="batchText" placeholder="27285332742&#10;某抖音号或主页链接&#10;..."></textarea>
+      <textarea id="batchText" placeholder="12345678&#10;某抖音号或主页链接&#10;..."></textarea>
     </div>
 
     <label>存储位置（下载的视频、图片、评论 CSV 都保存在这里）</label>
@@ -747,7 +747,7 @@ function onMode() {
   $("limitLabel").style.display = isBatch ? "none" : "";
   $("limit").style.display = isBatch ? "none" : "";
   const labels = {
-    user:     ["目标（抖音号 / 主页链接 / App 分享文案）", "例如：27285332742 或 https://v.douyin.com/xxxx/", "数量限制", "全部"],
+    user:     ["目标（抖音号 / 主页链接 / App 分享文案）", "例如：12345678 或 https://v.douyin.com/xxxx/", "数量限制", "全部"],
     single:   ["视频链接 / App 分享文案", "粘贴视频链接或分享文案，如 https://v.douyin.com/xxxx/", "数量限制", "1"],
     search:   ["搜索关键词", "如：家常菜、篮球教程、旅行 vlog（若弹验证请在浏览器窗口手动完成）", "数量限制", "全部"],
     comments: ["视频链接 / App 分享文案", "粘贴视频链接，评论将导出为 CSV", "评论数量上限", "全部"],
