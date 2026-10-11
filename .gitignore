@@ -1,0 +1,32 @@
+# 运行时产物
+debug.log
+cookies.txt
+*.cookies.bak
+cookies.txt.bak
+
+# 下载输出
+downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.venv/
+
+# 调试临时文件
+_dbg/
+_t_*.py
+_debug*.py
+
+# 本地文档与截图（含平台字样，不入库）
+使用说明.md
+界面预览.png
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# 本地工具元数据
+.workbuddy/
