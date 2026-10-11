@@ -19,7 +19,8 @@
        python douyin_live_recorder.py --url ... --start 20:00 --minutes 120   # 今晚 8 点开录，录到 10 点
        python douyin_live_recorder.py --url "https://www.douyin.com/user/xxx" --start 20:00
            # 主播还没开播（拿不到直播间号）也能定时：先打开主播主页等开播，
-           # 检测到「直播中」入口后自动找到直播间并开始录制（也支持 App 分享文案）
+           # 检测到「直播中」入口后自动找到直播间并开始录制
+           # 也支持只填抖音号/昵称（自动解析主页），或 App 分享文案
 
 说明：
   - 时间按分钟指定（--minutes），也可以只定时开始（--start），到点自动开录
@@ -44,6 +45,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     import ctypes
@@ -327,18 +329,63 @@ class LiveRecorder:
         m = re.search(r"https?://[^\s\"'<>，。；]+", query.strip())
         return m.group(0) if m else None
 
-    def _wait_for_live(self, query):
-        """目标不是直播间而是主播主页/分享文案：打开主页轮询等开播。
+    def _resolve_profile(self, name):
+        """把纯文字抖音号/昵称解析成主播主页链接。
 
-        每 60 秒刷新主页，检测到「直播中」入口（指向 live.douyin.com 的
+        优先走 www.douyin.com/@抖音号 直达主页（无风控）；失败再退到
+        抖音搜索页（type=user）找人，取文案里含关键词的第一条结果。
+        """
+        name = name.strip().lstrip("@")
+        log(f"输入的是抖音号/昵称，先解析出主播主页: {name}")
+        try:
+            self._page.goto(f"https://www.douyin.com/@{quote(name)}",
+                            wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            if "/user/" in self._page.url:
+                log("已通过 @抖音号 直达主播主页")
+                return self._page.url
+        except Exception:
+            pass
+        log("@主页直达没命中，改走抖音搜索页找人...")
+        try:
+            self._page.goto(
+                f"https://www.douyin.com/search/{quote(name)}?type=user",
+                wait_until="domcontentloaded", timeout=60000)
+        except Exception as e:
+            log(f"打开搜索页失败: {type(e).__name__}: {e}")
+            return None
+        time.sleep(3)
+        self._check_captcha()
+        cands = self._page.evaluate("""
+() => {
+  const out = [];
+  document.querySelectorAll('a[href*="/user/"]').forEach(a => {
+    out.push({href: a.href, text: (a.innerText || '').trim().slice(0, 60)});
+  });
+  return out;
+}
+""")
+        if not cands:
+            log("搜索结果里找不到用户链接（风控 / 无此人 / 页面结构变化）")
+            return None
+        best = next((c for c in cands if name in c["text"]), cands[0])
+        log(f"搜索到候选用户: {best['text'] or '无文字'}")
+        return best["href"]
+
+    def _wait_for_live(self, query):
+        """目标不是直播间而是主播主页/分享文案/抖音号：等开播并解析直播间。
+
+        每 120 秒刷新主页，检测到「直播中」入口（指向 live.douyin.com 的
         链接）后返回直播间地址；短链直接跳进直播间的也一并识别。
         """
         url = self._extract_url(query)
         if not url:
-            log("这个目标不是直播间，也从里面提取不出链接。")
-            log("未开播的直播间没有房间号，请填主播主页链接（douyin.com/user/...）"
-                "或 App 分享文案（含 v.douyin.com 短链）")
-            sys.exit(1)
+            # 纯文字：当作抖音号/昵称，解析出主页链接
+            url = self._resolve_profile(query)
+            if not url:
+                log("解析不出主播主页。请填直播间链接、主播主页链接"
+                    "（douyin.com/user/...）、App 分享文案或抖音号")
+                sys.exit(1)
         log(f"目标不是直播间，先打开主播主页等开播: {url}")
         while True:
             self._poll_stop()
@@ -1065,8 +1112,8 @@ def main():
         print("=" * 60)
         print("抖音直播录制器（录制纯净画面，无弹幕/评论/人数等 UI）")
         print("=" * 60)
-        print("提示：直播间还没开播时可填主播主页链接或 App 分享文案，开播自动找到直播间")
-        query = input("请输入直播间链接/房间号/主播主页链接: ").strip()
+        print("提示：未开播时可填主播主页链接、抖音号/昵称或 App 分享文案，开播自动找到直播间")
+        query = input("请输入直播间链接/房间号/抖音号/主播主页链接: ").strip()
         if not query:
             print("未输入，退出")
             sys.exit(1)
