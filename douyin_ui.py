@@ -55,7 +55,7 @@ class Runner:
             }
 
     def start(self, mode, query, cookie_text, limit, since=None, until=None,
-              start_at=None, batch_type=None, outdir=None, sort=None):
+              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None):
         with self.lock:
             if self.running:
                 return "已有任务在运行，请先停止或等待完成"
@@ -134,6 +134,11 @@ class Runner:
         if mode == "live":
             cmd = [sys.executable, recorder, "--cookie-file", str(cookie_path)] + outdir_arg
             cmd += ["--room" if re.fullmatch(r"\d{5,}", query) else "--url", query]
+            # 录制视角：clean=纯净原始流（默认） / view=观看视角（画面含弹幕）
+            if danmode == "view":
+                cmd += ["--danmode", "view"]
+            elif danmode not in (None, "", "clean"):
+                return "录制视角参数不合法"
             if (start_at or "").strip():
                 sa = start_at.strip()
                 if not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?|\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?", sa):
@@ -609,7 +614,13 @@ PAGE = """<!DOCTYPE html>
     </div>
 
     <div id="liveRow" style="display:none">
-      <label>定时开始（如 20:00 或 2026-10-11 20:00，留空 = 立即开始）</label>
+      <label>录制视角</label>
+      <select id="danmode">
+        <option value="clean">纯净原始流（无弹幕，原画质）</option>
+        <option value="view">观看视角（画面含弹幕，录屏+原声）</option>
+      </select>
+      <div class="hint" style="margin-top:4px">观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口；画质为播放分辨率，需要已安装 ffmpeg。</div>
+      <label style="margin-top:10px">定时开始（如 20:00 或 2026-10-11 20:00，留空 = 立即开始）</label>
       <input type="text" id="startat" placeholder="主播没开播会自动等待，开播即录">
     </div>
 
@@ -740,7 +751,8 @@ async function start() {
     startat: $("startat").value,
     batchType: $("batchType").value,
     outdir: $("outdir").value,
-    sort: searchSort
+    sort: searchSort,
+    danmode: $("danmode") ? $("danmode").value : "clean"
   });
   if (res.error) { setStatus(res.error, "err"); }
   else { $("logbox").textContent = ""; cursor = 0; poll(); }
@@ -882,7 +894,7 @@ class Handler(BaseHTTPRequestHandler):
                                data.get("since"), data.get("until"),
                                data.get("startat"),
                                data.get("batchType"), data.get("outdir"),
-                               data.get("sort"))
+                               data.get("sort"), data.get("danmode"))
             self._send(200, json.dumps({"error": err}, ensure_ascii=False))
         elif self.path == "/login":
             err = runner.start("login", None, None, None)
@@ -915,7 +927,9 @@ def main():
 
     url = f"http://127.0.0.1:{port}"
     print(f"爬虫界面已启动: {url}  （关闭本窗口即退出）")
-    threading.Timer(0.5, webbrowser.open, args=(url,)).start()
+    # DY_NO_BROWSER=1 时不自动开浏览器（测试/后台启动用）
+    if os.environ.get("DY_NO_BROWSER") != "1":
+        threading.Timer(0.5, webbrowser.open, args=(url,)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

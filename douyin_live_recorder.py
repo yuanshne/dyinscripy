@@ -55,6 +55,9 @@ except ImportError:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+# 观看视角模式：浏览器窗口钉在这个位置/大小，gdigrab 按同一屏幕区域采集
+VIEW_WIN = (30, 30, 1300, 820)
+
 # 交互判定：网页外壳（DY_UNATTENDED=1）或 stdin 不可读时按无人值守处理
 INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
                and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
@@ -152,12 +155,14 @@ def flv_to_mp4(flv_path):
 
 
 class LiveRecorder:
-    def __init__(self, cookies, outdir, duration=0, headless=False, start_ts=None):
+    def __init__(self, cookies, outdir, duration=0, headless=False, start_ts=None,
+                 danmode="clean"):
         self.cookies = cookies
         self.outdir = Path(outdir)
         self.duration = duration      # 最长录制秒数，0 = 不限
         self.headless = headless
         self.start_ts = start_ts      # 定时开始的时间戳，None = 立即开始
+        self.danmode = danmode or "clean"   # clean=纯净原始流 / view=观看视角(含弹幕)
 
         self.stream_url = None        # 拦截到的拉流地址
         self.stream_kind = None       # "flv" / "m3u8"
@@ -175,13 +180,20 @@ class LiveRecorder:
     def start_browser(self):
         log("启动浏览器...")
         self._pw = sync_playwright().start()
+        args = ["--disable-blink-features=AutomationControlled"]
+        if self.danmode == "view":
+            # 观看视角：窗口钉在固定位置，gdigrab 按同一区域采集画面
+            args += [f"--window-position={VIEW_WIN[0]},{VIEW_WIN[1]}",
+                     f"--window-size={VIEW_WIN[2]},{VIEW_WIN[3]}"]
         self._browser = self._pw.chromium.launch(
             headless=self.headless,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=args,
         )
+        vp = ({"width": 1280, "height": 700} if self.danmode == "view"
+              else {"width": 1600, "height": 900})
         self._context = self._browser.new_context(
             user_agent=UA,
-            viewport={"width": 1600, "height": 900},
+            viewport=vp,
             locale="zh-CN",
             timezone_id="Asia/Shanghai",
         )
@@ -409,6 +421,133 @@ class LiveRecorder:
             return mp4.stat().st_size
         return 0
 
+    # ---------- 观看视角录制 ----------
+
+    def _record_viewmode(self, room_id):
+        """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
+
+        与纯净模式不同，页面必须保持打开且不被遮挡（录的就是这块屏幕区域），
+        因此资源占用更高、画质为播放分辨率而非原始流分辨率。
+        一个 ffmpeg 进程同时采集屏幕和直播流声音，直接输出 mp4。
+        """
+        if not has_ffmpeg():
+            log("❗观看视角录制需要 ffmpeg（用于屏幕采集），未检测到 ffmpeg")
+            log("   请先安装 ffmpeg，或改用「纯净原始流」模式")
+            return
+        vx, vy, vw, vh = VIEW_WIN
+        log(f"观看视角模式：录制屏幕区域 ({vx},{vy}) {vw}x{vh}，画面含弹幕等界面元素")
+        log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
+        # 页面取消静音，和平时看直播一样（录制声音仍直接取自原始流，互不影响）
+        try:
+            self._page.evaluate(
+                "document.querySelectorAll('video').forEach(v=>{v.muted=false;v.volume=1;})")
+        except Exception:
+            pass
+
+        part, fails, recorded = 1, 0, 0
+        while fails < 3 and not self._time_up():
+            self._check_captcha()
+            log(f"寻找直播流（作为声音来源）...（第 {part} 段）")
+            _, url = self.wait_for_stream(20)
+            if not url:
+                cands = self._streams_from_page()
+                if cands:
+                    url = cands[0]
+            if not url:
+                if self._looks_not_live():
+                    if self._live_ended():
+                        log("主播已下播，结束录制")
+                        break
+                    log("主播当前没在直播，每 60 秒刷新等待开播...")
+                    wait_until = time.time() + 60
+                    while time.time() < wait_until and not self._time_up():
+                        time.sleep(2)
+                    self._reopen_room()
+                    continue
+                log("拿不到直播流地址（观看视角的声音需要从直播流提取）")
+                self._check_captcha()
+                pause("  请看一眼浏览器窗口确认状态，按回车重试...")
+                fails += 1
+                continue
+
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            mp4 = self.outdir / f"{room_id}_{stamp}_part{part}_观看视角.mp4"
+            if self.t_start is None:
+                self.t_start = time.time()
+                if self.duration:
+                    log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
+            log(f"✅ 开始观看视角录制 → {mp4.name}")
+            cmd = ["ffmpeg", "-y", "-loglevel", "error",
+                   "-f", "gdigrab", "-framerate", "30",
+                   "-offset_x", str(vx), "-offset_y", str(vy),
+                   "-video_size", f"{vw}x{vh}", "-i", "desktop",
+                   "-user_agent", UA,
+                   "-headers", "Referer: https://live.douyin.com/\r\n",
+                   "-i", url,
+                   "-map", "0:v", "-map", "1:a",
+                   "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                   "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-b:a", "160k",
+                   str(mp4)]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+
+            def stop_ffmpeg():
+                # 必须发 q 让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）
+                if proc.poll() is None:
+                    try:
+                        proc.stdin.write(b"q")
+                        proc.stdin.flush()
+                    except Exception:
+                        pass
+                    try:
+                        proc.wait(timeout=15)
+                    except Exception:
+                        proc.kill()
+
+            last_report = time.time()
+            while proc.poll() is None and not self._time_up():
+                time.sleep(3)
+                if mp4.exists() and time.time() - last_report >= 30:
+                    log(f"  录制中... {mp4.stat().st_size / 1048576:.1f} MB")
+                    last_report = time.time()
+                if self._live_ended():
+                    log("页面显示直播已结束，停止录制")
+                    break
+                self._check_captcha()
+            stop_ffmpeg()
+
+            size = mp4.stat().st_size if mp4.exists() else 0
+            if size >= 102400:
+                recorded += 1
+                log(f"  本段录制 {size / 1048576:.1f} MB")
+                part += 1
+                fails = 0
+                if self._time_up():
+                    break
+                log("流断开了，尝试重连（主播下播的话会自动结束）...")
+                self._reopen_room()
+                if self._live_ended():
+                    log("主播已下播，结束录制")
+                    break
+            else:
+                if mp4.exists() and size < 10240:
+                    mp4.unlink()
+                if recorded:
+                    log("本段没有录到有效数据，判定直播已结束，收尾")
+                    break
+                fails += 1
+                log(f"本段没有录到有效数据（{fails}/3），重试...")
+
+        if not recorded:
+            log("观看视角没有录到任何内容，退出")
+            return
+        log("=" * 60)
+        log(f"观看视角录制完成！共 {recorded} 段，保存在: {self.outdir}")
+        log("画面含弹幕等界面元素（与网页观看一致），声音来自原始直播流")
+        log("=" * 60)
+
     # ---------- 主流程 ----------
 
     def run(self, query):
@@ -434,9 +573,13 @@ class LiveRecorder:
         self.t_start = None
 
         self.start_browser()
-        finished = []   # (文件路径, 大小)
+        finished = []
         try:
             room_id = self.open_room(query)
+            # 观看视角走独立流程（录屏幕画面，不下载原始流文件）
+            if self.danmode == "view":
+                self._record_viewmode(room_id)
+                return
             fails = 0
             part = 1
             while fails < 3 and not self._time_up():
@@ -561,6 +704,8 @@ def main():
                         help="输出目录（默认 脚本目录/downloads/live）")
     parser.add_argument("--headless", action="store_true",
                         help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
+    parser.add_argument("--danmode", choices=["clean", "view"], default="clean",
+                        help="录制视角：clean=纯净原始流(无弹幕) view=观看视角(画面含弹幕，录屏)")
     args = parser.parse_args()
 
     query = args.url or args.room
@@ -585,6 +730,10 @@ def main():
                 args.minutes = int(m)
             elif m:
                 print(f"「{m}」不是数字，按不限时长处理")
+        if not args.danmode or args.danmode == "clean":
+            d = input("录制视角：1=纯净原始流(无弹幕) 2=观看视角(画面含弹幕)（回车=1）: ").strip()
+            if d == "2":
+                args.danmode = "view"
 
     start_ts = None
     if args.start:
@@ -612,7 +761,8 @@ def main():
 
     recorder = LiveRecorder(cookies, args.outdir,
                             duration=(args.minutes or 0) * 60,
-                            headless=args.headless, start_ts=start_ts)
+                            headless=args.headless, start_ts=start_ts,
+                            danmode=args.danmode)
     try:
         recorder.run(query)
     except KeyboardInterrupt:
