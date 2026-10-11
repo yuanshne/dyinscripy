@@ -22,8 +22,63 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-BASE_DIR = Path(__file__).parent
+FROZEN = getattr(sys, "frozen", False)
+
+if FROZEN:
+    # exe 模式：cookies/输出都落在 exe 同级目录；浏览器内核在包内 runtime/
+    BASE_DIR = Path(sys.executable).parent
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH",
+                          str(BASE_DIR / "runtime" / "ms-playwright"))
+    # 双击 exe 的控制台默认 GBK，emoji/特殊符号会让 print 直接崩：
+    # 控制台切 UTF-8 代码页，输出流强制 utf-8
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+else:
+    BASE_DIR = Path(__file__).parent
+
 PORT = 8765
+
+
+def task_cmd(kind):
+    """构造子任务命令。
+
+    脚本模式：python douyin_spider.py ... ；exe 模式：自身以
+    「抖音工具箱.exe --task spider ...」二次启动，由入口分发执行。
+    """
+    if FROZEN:
+        return [sys.executable, "--task", kind]
+    return [sys.executable, str(BASE_DIR / f"douyin_{kind}.py")]
+
+
+def _frozen_task_dispatch():
+    """exe 被当作子任务调用（--task spider|recorder|login）时执行对应
+    脚本的 main() 然后退出，不再启动网页外壳。"""
+    if not (FROZEN and len(sys.argv) >= 3 and sys.argv[1] == "--task"):
+        return False
+    kind = sys.argv[2]
+    sys.argv = [sys.argv[0]] + sys.argv[3:]
+    if kind == "spider":
+        import douyin_spider
+        douyin_spider.main()
+    elif kind == "recorder":
+        import douyin_live_recorder
+        douyin_live_recorder.main()
+    elif kind == "login":
+        import douyin_login
+        douyin_login.main()
+    else:
+        raise SystemExit(f"未知任务类型: {kind}")
+    return True
+
+
+if FROZEN and _frozen_task_dispatch():
+    raise SystemExit(0)
 
 # ---------------------------------------------------------------- 运行状态
 
@@ -86,8 +141,8 @@ class Runner:
                 self._pending = []
             self.log("启动登录助手：请在弹出的浏览器窗口里扫码登录抖音…")
             self.log("登录成功后会自动保存 Cookie 并结束，期间不用管它。")
-            self._launch([sys.executable, str(BASE_DIR / "douyin_login.py"),
-                          "--out", str(BASE_DIR / "cookies.txt")])
+            self._launch(task_cmd("login") +
+                         ["--out", str(BASE_DIR / "cookies.txt")])
             return None
 
         query = (query or "").strip()
@@ -139,14 +194,11 @@ class Runner:
         elif sort not in (None, "", "general"):
             return "排序参数不合法"
 
-        spider = str(BASE_DIR / "douyin_spider.py")
-        recorder = str(BASE_DIR / "douyin_live_recorder.py")
-
         def base_spider_cmd():
-            return [sys.executable, spider, "--cookie-file", str(cookie_path)] + outdir_arg
+            return task_cmd("spider") + ["--cookie-file", str(cookie_path)] + outdir_arg
 
         if mode == "live":
-            cmd = [sys.executable, recorder, "--cookie-file", str(cookie_path)] + outdir_arg
+            cmd = task_cmd("recorder") + ["--cookie-file", str(cookie_path)] + outdir_arg
             cmd += ["--room" if re.fullmatch(r"\d{5,}", query) else "--url", query]
             # 录制视角：clean=纯净原始流（默认） / view=观看视角（画面含弹幕）
             if danmode == "view":

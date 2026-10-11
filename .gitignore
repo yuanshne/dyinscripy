@@ -13,6 +13,11 @@ __pycache__/
 *.pyc
 .venv/
 
+# PyInstaller 打包产物
+build/
+dist/
+*.zip
+
 # 调试临时文件
 _dbg/
 _t_*.py
