@@ -455,10 +455,13 @@ class LiveRecorder:
                             f"选用最高画质档（{tag}）")
 
                 if not url:
+                    # 已经录到内容：流断了且找不回来，大概率主播已下播。
+                    # 直接收尾转封装，不再反复找流干等（用户明确要求的行为）
+                    if finished:
+                        log("已录到的流中断后未能恢复，判定主播已下播，"
+                            "结束录制并收尾转封装")
+                        break
                     if self._looks_not_live():
-                        if finished and self._live_ended():
-                            log("主播已下播（直播已结束），提前结束录制并收尾")
-                            break
                         log("主播当前没在直播。脚本会一直等，每 60 秒刷新检查，开播后自动开始录"
                             + ("（不想等就 Ctrl+C 退出）" if INTERACTIVE
                                else "（可在网页界面点「停止」结束）"))
@@ -515,6 +518,10 @@ class LiveRecorder:
                 else:
                     if raw.exists() and raw.stat().st_size < 10240:
                         raw.unlink()
+                    if finished:
+                        # 本段几乎没录到数据且前面已有内容：流已断，直接收尾
+                        log("本段没有录到有效数据，判定直播已结束，收尾转封装")
+                        break
                     fails += 1
                     log(f"本段没有录到有效数据（{fails}/3），重试...")
 
