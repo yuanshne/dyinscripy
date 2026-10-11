@@ -3,23 +3,9 @@ chcp 65001 >nul
 title 抖音工具箱
 cd /d "%~dp0"
 
-rem ============ 找一个可用的 Python ============
-set "PY="
-if exist ".venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-if defined PY goto :checkpy
-if exist "C:\Users\A\.workbuddy\binaries\python\envs\default\Scripts\python.exe" set "PY=C:\Users\A\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
-if defined PY goto :checkpy
-where py >nul 2>nul && set "PY=py"
-if defined PY goto :checkpy
-where python >nul 2>nul && set "PY=python"
-if defined PY goto :checkpy
-
-echo  [!] 未找到 Python，请先安装 Python 并勾选 Add to PATH
-pause
-exit /b 1
-
-:checkpy
-%PY% -c "import sys" >nul 2>nul || goto :nopython2
+rem ============ 探测 Python（.venv / conda / py 启动器 / PATH）============
+call "%~dp0_find_python.bat"
+if not defined PY goto :nopy
 
 rem ============ 首次运行自动装依赖 ============
 %PY% -c "import playwright, requests" >nul 2>nul
@@ -37,8 +23,8 @@ echo  正在启动抖音工具箱，浏览器会自动打开（关掉本窗口 =
 %PY% douyin_ui.py
 goto :eof
 
-:nopython2
-echo  [!] 未找到可用的 Python，请先安装 Python 并勾选 Add to PATH
+:nopy
+echo  [!] 未找到可用的 Python，请安装 Python 或 Anaconda/Miniconda 并加入 PATH
 pause
 exit /b 1
 

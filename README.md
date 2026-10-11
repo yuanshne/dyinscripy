@@ -15,7 +15,7 @@
 
 ## 快速开始
 
-1. 安装 [Python](https://www.python.org/downloads/) 3.9+（安装时勾选 **Add to PATH**）；直播录制合成 mp4 需要系统已安装 [ffmpeg](https://ffmpeg.org/download.html)
+1. 安装 [Python](https://www.python.org/downloads/) 3.9+（安装时勾选 **Add to PATH**）或 Anaconda/Miniconda 均可，脚本会自动探测可用的 Python 环境（项目 .venv → conda 环境 → 官方 py 启动器 → PATH）；直播录制合成 mp4 需要系统已安装 [ffmpeg](https://ffmpeg.org/download.html)
 2. 双击 **`打开爬虫界面.bat`** —— 首次运行会自动装依赖、下载浏览器内核，然后自动打开网页
 3. 首次使用点「重新登录（更新 Cookie）」，在弹出的浏览器里扫码登录，Cookie 自动保存
 4. 在网页里选功能、填目标、点开始，日志实时滚动显示进度

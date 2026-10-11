@@ -22,6 +22,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+def wait_enter():
+    """双击运行时停一下让用户看到结果；被脚本/网页调用（无键盘输入）时跳过"""
+    try:
+        input("按回车键关闭...")
+    except (EOFError, OSError):
+        pass
+
+
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -38,14 +46,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
-
-
-def wait_enter():
-    """双击运行时停一下让用户看到结果；被脚本/网页调用（无键盘输入）时跳过"""
-    try:
-        input("按回车键关闭...")
-    except (EOFError, OSError):
-        pass
 
 
 def cookies_ready(names):

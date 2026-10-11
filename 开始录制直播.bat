@@ -3,23 +3,10 @@ chcp 65001 >nul
 title 直播录制
 cd /d "%~dp0"
 
-rem ============ 找一个可用的 Python ============
-set "PY="
-if exist ".venv\Scripts\python.exe" set "PY=%~dp0.venv\Scripts\python.exe"
-if defined PY goto :checkpy
-if exist "C:\Users\A\.workbuddy\binaries\python\envs\default\Scripts\python.exe" set "PY=C:\Users\A\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
-if defined PY goto :checkpy
-where py >nul 2>nul && set "PY=py"
-if defined PY goto :checkpy
-where python >nul 2>nul && set "PY=python"
-if defined PY goto :checkpy
+rem ============ 探测 Python（.venv / conda / py 启动器 / PATH）============
+call "%~dp0_find_python.bat"
+if not defined PY goto :nopy
 
-echo  [!] 未找到 Python，请先安装 Python 并勾选 Add to PATH
-pause
-exit /b 1
-
-:checkpy
-%PY% -c "import sys" >nul 2>nul || goto :nopy
 %PY% -c "import requests" >nul 2>nul
 if errorlevel 1 goto :install
 goto :run
@@ -46,7 +33,7 @@ pause
 exit /b 0
 
 :nopy
-echo  [!] 未找到可用的 Python，请先安装 Python 并勾选 Add to PATH
+echo  [!] 未找到可用的 Python，请安装 Python 或 Anaconda/Miniconda 并加入 PATH
 pause
 exit /b 1
 
