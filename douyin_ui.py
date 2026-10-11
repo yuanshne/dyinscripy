@@ -10,6 +10,7 @@
 启动：python douyin_ui.py  （会自动打开浏览器）
 """
 
+import glob
 import json
 import os
 import re
@@ -56,11 +57,40 @@ def task_cmd(kind):
     return [sys.executable, str(BASE_DIR / f"douyin_{kind}.py")]
 
 
+def _ensure_runtime_chromium():
+    """轻量版首次启动：包里没有 Chromium 内核时自动从国内镜像下载。
+
+    完整版包内自带 runtime/ms-playwright，本函数直接跳过。
+    """
+    if not FROZEN:
+        return
+    root = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", ""))
+    if glob.glob(str(root / "chromium-*")):
+        return
+    print("首次运行：正在下载浏览器内核 Chromium（约150MB，走国内镜像，仅此一次）...")
+    print("下载期间请保持联网，完成后会自动继续启动。")
+    base = Path(getattr(sys, "_MEIPASS", "."))
+    node = base / "playwright" / "driver" / "node.exe"
+    cli = base / "playwright" / "driver" / "package" / "cli.js"
+    env = {**os.environ,
+           "PLAYWRIGHT_DOWNLOAD_HOST": "https://cdn.npmmirror.com/binaries/playwright"}
+    try:
+        r = subprocess.run([str(node), str(cli), "install", "chromium"], env=env)
+    except Exception as e:
+        r = None
+        print(f"[!] 内核下载出错: {e}")
+    if r is None or r.returncode != 0:
+        print("[!] 内核下载未完成，请检查网络后重新运行本程序")
+        print("    （也可以手动下载「内核包」zip，解压出 runtime 文件夹放到 exe 旁边）")
+        sys.exit(1)
+
+
 def _frozen_task_dispatch():
     """exe 被当作子任务调用（--task spider|recorder|login）时执行对应
     脚本的 main() 然后退出，不再启动网页外壳。"""
     if not (FROZEN and len(sys.argv) >= 3 and sys.argv[1] == "--task"):
         return False
+    _ensure_runtime_chromium()   # 子任务也可能先于外壳启动（命令行直调）
     kind = sys.argv[2]
     sys.argv = [sys.argv[0]] + sys.argv[3:]
     if kind == "spider":
@@ -999,6 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    _ensure_runtime_chromium()   # 轻量版首次启动先补内核
     server = None
     port = PORT
     for p in range(PORT, PORT + 20):

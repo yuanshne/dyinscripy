@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 rem 需要：本机已装 Python + playwright + imageio-ffmpeg + pyinstaller
 python -m PyInstaller douyin_toolbox.spec --noconfirm || goto :err
+copy /y "%~dp0包内使用说明.txt" "%~dp0dist\抖音工具箱\使用说明.txt" >nul
 
 rem 构建会把 dist 清空，Chromium 内核必须在构建之后放进包里
 set "PLAYWRIGHT_BROWSERS_PATH=%~dp0dist\抖音工具箱\runtime\ms-playwright"
