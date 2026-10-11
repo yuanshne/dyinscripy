@@ -1,0 +1,2 @@
+# cmd 对 UTF-8 + LF 的 bat 会在 chcp 后解析错位，必须保证 CRLF
+*.bat text eol=crlf
