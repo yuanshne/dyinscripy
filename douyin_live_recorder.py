@@ -29,10 +29,11 @@
   - 主播下播（页面显示"直播已结束"）会自动停止录制并收尾，不会空等到期
   - "主播暂时离开"不算下播，会继续等待主播回来
   - 录制期间页面自动切到空白页（弹幕/动画/视频解码全部停掉），不会越录越卡
-  - 录完如果本机装有 ffmpeg，会把 .flv 自动转封装成 .mp4（无损、秒完成）
-  - 没有 ffmpeg 也能用，产出 .flv 文件（VLC / PotPlayer 可直接播放）
+  - 录完如果有 ffmpeg（系统 PATH 或首次安装自带的 imageio-ffmpeg），
+    会把 .flv 自动转封装成 .mp4（无损、秒完成）
+  - 完全没有 ffmpeg 也能用，产出 .flv 文件（VLC / PotPlayer 可直接播放）
 
-依赖（已预装在专用环境里）: playwright, requests
+依赖（已预装在专用环境里）: playwright, requests, imageio-ffmpeg（内置 ffmpeg）
 仅供个人学习研究使用，请勿二次传播录制内容。
 """
 
@@ -145,8 +146,21 @@ def parse_when(s):
     return None, f"认不出这个时间「{s}」，请写 20:00 这样的时刻，或 2026-10-11 20:00 完整时间"
 
 
+def ffmpeg_cmd():
+    """返回可用的 ffmpeg 命令：优先系统 PATH，找不到就用
+    imageio-ffmpeg 包内置的 ffmpeg（首次 bat 安装会装上），都没有返回 None
+    """
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
 def has_ffmpeg():
-    return shutil.which("ffmpeg") is not None
+    return ffmpeg_cmd() is not None
 
 
 def os_display_scale():
@@ -174,7 +188,7 @@ def flv_to_mp4(flv_path):
     mp4 = flv_path.with_suffix(".mp4")
     try:
         r = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error",
+            [ffmpeg_cmd(), "-y", "-loglevel", "error",
              "-i", str(flv_path), "-c", "copy", str(mp4)],
             capture_output=True, timeout=600)
     except Exception as e:
@@ -614,7 +628,7 @@ class LiveRecorder:
         """兜底：只有 hls 流且本机有 ffmpeg 时，直接用 ffmpeg 录成 mp4"""
         mp4 = base_path.with_suffix(".mp4")
         headers = "Referer: https://live.douyin.com/\r\n"
-        cmd = ["ffmpeg", "-y", "-loglevel", "error",
+        cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
                "-user_agent", UA, "-headers", headers,
                "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(mp4)]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
@@ -773,7 +787,7 @@ class LiveRecorder:
         probe = Path(os.environ.get("TEMP", ".")) / "_gdigrab_probe.png"
         try:
             subprocess.run(
-                ["ffmpeg", "-y", "-loglevel", "error", "-f", "gdigrab",
+                [ffmpeg_cmd(), "-y", "-loglevel", "error", "-f", "gdigrab",
                  "-i", "desktop", "-frames", "1", str(probe)],
                 capture_output=True, timeout=30)
             with open(probe, "rb") as fh:
@@ -798,7 +812,7 @@ class LiveRecorder:
         """
         if not has_ffmpeg():
             log("❗观看视角录制需要 ffmpeg（用于屏幕采集），未检测到 ffmpeg")
-            log("   请先安装 ffmpeg，或改用「纯净原始流」模式")
+            log("   重新运行「打开爬虫界面.bat」会自动装上，或改用「纯净原始流」模式")
             return
         vx, vy, vw, vh = VIEW_WIN
         grab_scale = self._probe_grab_scale()
@@ -856,7 +870,7 @@ class LiveRecorder:
                 if self.duration:
                     log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
             log(f"✅ 开始观看视角录制 → {mp4.name}")
-            cmd = ["ffmpeg", "-y", "-loglevel", "error",
+            cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
                    "-f", "gdigrab", "-framerate", "30",
                    "-offset_x", str(vx), "-offset_y", str(vy),
                    "-video_size", f"{vw}x{vh}", "-i", "desktop",
