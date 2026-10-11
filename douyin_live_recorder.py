@@ -17,6 +17,9 @@
        python douyin_live_recorder.py --room 123456789
        python douyin_live_recorder.py --url ... --minutes 90              # 录 90 分钟
        python douyin_live_recorder.py --url ... --start 20:00 --minutes 120   # 今晚 8 点开录，录到 10 点
+       python douyin_live_recorder.py --url "https://www.douyin.com/user/xxx" --start 20:00
+           # 主播还没开播（拿不到直播间号）也能定时：先打开主播主页等开播，
+           # 检测到「直播中」入口后自动找到直播间并开始录制（也支持 App 分享文案）
 
 说明：
   - 时间按分钟指定（--minutes），也可以只定时开始（--start），到点自动开录
@@ -43,6 +46,12 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
+    import ctypes
+    import ctypes.wintypes
+except ImportError:
+    ctypes = None  # 非 Windows 环境用不到 gdigrab，这里只做兜底
+
+try:
     import requests
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -55,8 +64,12 @@ except ImportError:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# 观看视角模式：浏览器窗口钉在这个位置/大小，gdigrab 按同一屏幕区域采集
+# 观看视角模式：浏览器窗口钉在这个位置/大小（逻辑像素），gdigrab 只采集
+# 其中播放器的真实区域（运行时动态定位，含弹幕层）
 VIEW_WIN = (30, 30, 1300, 820)
+
+# 「停止」标记文件：网页界面点「停止」时放置，录制器轮询到后优雅收尾退出
+_STOP_FLAG = Path(__file__).parent / "stop.flag"
 
 # 交互判定：网页外壳（DY_UNATTENDED=1）或 stdin 不可读时按无人值守处理
 INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
@@ -134,6 +147,24 @@ def has_ffmpeg():
     return shutil.which("ffmpeg") is not None
 
 
+def os_display_scale():
+    """主屏的 Windows 显示缩放倍率（1.0 / 1.25 / 1.5 ...），失败返回 1.0。
+
+    浏览器窗口坐标（JS 里的 screenX 等）是逻辑像素（DIP），
+    而 gdigrab 在 DPI 感知模式下按物理像素采集，两者相差这个倍率。
+    """
+    if ctypes is None:
+        return 1.0
+    try:
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+        return ctypes.windll.user32.GetDpiForSystem() / 96.0
+    except Exception:
+        return 1.0
+
+
 def flv_to_mp4(flv_path):
     """用 ffmpeg 无损转封装 flv -> mp4，成功则删掉 flv，返回 mp4 路径"""
     if not has_ffmpeg():
@@ -150,6 +181,11 @@ def flv_to_mp4(flv_path):
     if r.returncode == 0 and mp4.exists() and mp4.stat().st_size > 10240:
         flv_path.unlink()
         return mp4
+    # 失败时清掉残留的半成品 mp4，保留原 .flv
+    try:
+        mp4.unlink(missing_ok=True)
+    except Exception:
+        pass
     log("  ffmpeg 转封装失败，保留原 .flv 文件")
     return None
 
@@ -169,6 +205,7 @@ class LiveRecorder:
         self.t_start = None           # 本次任务开始时间
         self._room_url = None         # 直播间真实地址（重连用）
         self._stop = False
+        self._finished = []           # 已录/在录的文件，任何退出路径统一收尾
 
         self._pw = None
         self._browser = None
@@ -241,6 +278,7 @@ class LiveRecorder:
         self.stream_url, self.stream_kind = None, None
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self._poll_stop()
             if self.stream_url:
                 return self.stream_kind, self.stream_url
             time.sleep(0.5)
@@ -275,6 +313,74 @@ class LiveRecorder:
         return sorted(out, key=rank)
 
     # ---------- 直播间 ----------
+
+    @staticmethod
+    def _is_direct_room(query):
+        """输入是否直接指向直播间：直播间链接或纯数字房间号"""
+        q = query.strip()
+        return bool(re.search(r"live\.douyin\.com/\d+", q)
+                    or re.fullmatch(r"\d{5,}", q))
+
+    @staticmethod
+    def _extract_url(query):
+        """从输入里提取 URL（App 分享文案里挖出第一个链接）"""
+        m = re.search(r"https?://[^\s\"'<>，。；]+", query.strip())
+        return m.group(0) if m else None
+
+    def _wait_for_live(self, query):
+        """目标不是直播间而是主播主页/分享文案：打开主页轮询等开播。
+
+        每 60 秒刷新主页，检测到「直播中」入口（指向 live.douyin.com 的
+        链接）后返回直播间地址；短链直接跳进直播间的也一并识别。
+        """
+        url = self._extract_url(query)
+        if not url:
+            log("这个目标不是直播间，也从里面提取不出链接。")
+            log("未开播的直播间没有房间号，请填主播主页链接（douyin.com/user/...）"
+                "或 App 分享文案（含 v.douyin.com 短链）")
+            sys.exit(1)
+        log(f"目标不是直播间，先打开主播主页等开播: {url}")
+        while True:
+            self._poll_stop()
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                log(f"打开主页失败: {type(e).__name__}: {e}，60 秒后重试")
+                time.sleep(60)
+                continue
+            time.sleep(3)
+            self._check_captcha()
+            info = self._page.evaluate("""
+() => {
+  const cands = [];
+  document.querySelectorAll('a[href*="live.douyin.com/"]').forEach(a => {
+    const m = a.href.match(/live\\.douyin\\.com\\/(\\d+)/);
+    if (m) cands.push({href: a.href, text: (a.innerText || '').trim().slice(0, 60)});
+  });
+  return {cands, url: location.href,
+          hasVideo: !!document.querySelector('video')};
+}
+""")
+            # 短链/主页链接直接落在了直播间页面
+            if re.search(r"live\.douyin\.com/\d+", info["url"]):
+                log("已直接进入直播间页面")
+                return info["url"]
+            # URL 指向直播域且页面在播视频：特殊形式的直播播放页
+            if ("live.douyin.com" in info["url"] or "/live/" in info["url"]) \
+                    and info["hasVideo"]:
+                log("检测到直播播放页")
+                return info["url"]
+            cands = info["cands"]
+            if cands:
+                # 优先选文案带「直播」的入口，避免点到推荐位里别人的直播间
+                best = next((c for c in cands if "直播" in c["text"]), cands[0])
+                log(f"检测到主播已开播（入口文案: {best['text'] or '无文字'}）")
+                return best["href"]
+            log("主播还没开播，120 秒后重新检查（不想等可停止/Ctrl+C 退出）...")
+            # 分段睡眠：保证「停止」请求随时能被响应
+            for _ in range(24):
+                self._poll_stop()
+                time.sleep(5)
 
     def open_room(self, query):
         """打开直播间页面，返回房间号（拿不到就返回 'live'）"""
@@ -361,9 +467,64 @@ class LiveRecorder:
         return (f"{h}小时{m}分{s}秒" if h else
                 f"{m}分{s}秒" if m else f"{s}秒")
 
+    def _poll_stop(self):
+        """检查「停止」请求（界面点停止会放标记文件），收到则抛出中断。
+
+        抛 KeyboardInterrupt 复用统一收尾路径：各层先把手上文件的收尾做掉
+        （下载部分改名 / 给 ffmpeg 发 q 写完 mp4 索引），run() 的 finally
+        再把所有片段转封装。
+        """
+        if not self._stop:
+            try:
+                self._stop = _STOP_FLAG.exists()
+            except Exception:
+                self._stop = False
+            if self._stop:
+                log("收到「停止」请求，正在收尾...")
+                try:
+                    _STOP_FLAG.unlink()
+                except Exception:
+                    pass
+        if self._stop:
+            raise KeyboardInterrupt
+        return False
+
+    def _finalize(self):
+        """收尾：把已录片段无损转封装成 mp4（任何退出路径都会走到这里）"""
+        if not self._finished:
+            return
+        log("=" * 60)
+        log("录制结束，处理文件...")
+        final_files = []
+        for f in self._finished:
+            if not f.exists():
+                continue
+            if f.stat().st_size < 10240:
+                f.unlink()   # 录坏了的小碎片直接删
+                continue
+            if f.suffix == ".flv":
+                mp4 = flv_to_mp4(f)
+                if mp4:
+                    log(f"  ✓ {mp4.name}（{mp4.stat().st_size/1048576:.1f} MB，"
+                        f"已从 flv 无损转封装）")
+                    final_files.append(mp4)
+                    continue
+            final_files.append(f)
+            log(f"  ✓ {f.name}（{f.stat().st_size/1048576:.1f} MB）")
+        if final_files:
+            log(f"共 {len(final_files)} 个文件，保存在: {self.outdir}")
+            if self.danmode == "view":
+                log("画面为播放器视角（含弹幕等界面元素），声音来自原始直播流")
+            else:
+                log("录制的是直播原始流：无弹幕、无评论、无在线人数、无任何界面元素")
+        else:
+            log("没有可保留的录制文件")
+        log("=" * 60)
+
     def wait_for_start(self):
         """定时等待：到点前 60 秒返回（留出启动浏览器的时间）"""
         while True:
+            self._poll_stop()
             remain = self.start_ts - time.time()
             if remain <= 60:
                 return
@@ -379,6 +540,7 @@ class LiveRecorder:
         tmp = base_path.with_suffix(".flv.part")
         size = 0
         last_report = time.time()
+        last_stopchk = time.time()
         try:
             with requests.get(url, headers=headers, stream=True,
                               timeout=(10, 30)) as r:
@@ -391,6 +553,9 @@ class LiveRecorder:
                         if time.time() - last_report >= 15:
                             log(f"  录制中... 已录 {size/1048576:.1f} MB")
                             last_report = time.time()
+                        if time.time() - last_stopchk >= 2:
+                            self._poll_stop()   # 收到停止请求会抛 KeyboardInterrupt
+                            last_stopchk = time.time()
                         if self._time_up():
                             break
         finally:
@@ -409,6 +574,7 @@ class LiveRecorder:
                                 stderr=subprocess.DEVNULL)
         try:
             while proc.poll() is None and not self._time_up():
+                self._poll_stop()
                 time.sleep(2)
         finally:
             if proc.poll() is None:
@@ -423,6 +589,159 @@ class LiveRecorder:
 
     # ---------- 观看视角录制 ----------
 
+    _PLAYER_RECT_JS = """
+() => {
+  const v = document.querySelector('video');
+  if (!v) return null;
+  const r = v.getBoundingClientRect();
+  if (r.width < 100 || r.height < 100) return null;
+  return {left: r.left, top: r.top, width: r.width, height: r.height};
+}
+"""
+
+    def _find_chrome_hwnd(self):
+        """按页面标题找到浏览器顶层窗口句柄（窗口标题包含页面标题）。
+
+        为什么不用 window.screenX：Playwright 用模拟视口时这些值是假的
+        （实测会返回 -21333 之类的乱值），必须从操作系统侧拿真实坐标。
+        """
+        if ctypes is None:
+            return None
+        try:
+            title = self._page.title()
+        except Exception:
+            return None
+        if not title:
+            return None
+        user32 = ctypes.windll.user32
+        matches = []
+
+        def cb(hwnd, _):
+            if user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    if title in buf.value:
+                        matches.append(hwnd)
+            return True
+
+        CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                     ctypes.c_void_p)
+        try:
+            user32.EnumWindows(CMPFUNC(cb), None)
+        except Exception:
+            return None
+        if not matches:
+            return None
+        # 多个窗口标题都匹配时，取面积最大的（主窗口）
+        best, best_area = None, 0
+        rect = ctypes.wintypes.RECT()
+        for h in matches:
+            if user32.GetWindowRect(h, ctypes.byref(rect)):
+                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+                if area > best_area:
+                    best, best_area = h, area
+        return best
+
+    def _viewport_origin(self, hwnd):
+        """拿网页视口原点的屏幕物理像素坐标。
+
+        Chromium 主窗口客户区包含标签栏/地址栏，而 getBoundingClientRect
+        是相对网页视口的。Chromium 有个子窗口 Chrome_RenderWidgetHostHWND
+        对应网页渲染区，对它做 ClientToScreen 得到的就是视口原点。
+        拿不到子窗口时退回主窗口客户区原点（会偏移一个工具栏高度）。
+        """
+        user32 = ctypes.windll.user32
+        target = []
+
+        def child_cb(child, _):
+            buf = ctypes.create_unicode_buffer(64)
+            user32.GetClassNameW(child, buf, 64)
+            if buf.value == "Chrome_RenderWidgetHostHWND":
+                target.append(child)
+            return True
+
+        CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
+                                     ctypes.c_void_p)
+        try:
+            user32.EnumChildWindows(hwnd, CMPFUNC(child_cb), None)
+        except Exception:
+            pass
+        pt = ctypes.wintypes.POINT(0, 0)
+        probe = target[0] if target else hwnd
+        if not user32.ClientToScreen(probe, ctypes.byref(pt)):
+            return None
+        return (pt.x, pt.y)
+
+    def _player_capture_rect(self, grab_scale):
+        """算出播放器（画面+弹幕层，两者重合）在屏幕上的 gdigrab 采集区域。
+
+        坐标换算：Playwright 强制 deviceScaleFactor=1，页面 CSS 像素就是
+        逻辑像素（DIP）；视口原点由 Win32 ClientToScreen 提供（物理像素），
+        元素偏移再乘 grab_scale（显示缩放）换算成物理像素。宽高取偶，
+        避免 x264/yuv420p 报奇数尺寸错误。取不到播放器返回 None。
+        """
+        info = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                info = self._page.evaluate(self._PLAYER_RECT_JS)
+            except Exception:
+                info = None
+            if info:
+                break
+            time.sleep(1)
+        if not info:
+            return None
+
+        hwnd = self._find_chrome_hwnd()
+        if hwnd is None:
+            return None
+        origin = self._viewport_origin(hwnd)
+        if origin is None:
+            return None
+        x = origin[0] + round(info["left"] * grab_scale)
+        y = origin[1] + round(info["top"] * grab_scale)
+        w = round(info["width"] * grab_scale) // 2 * 2
+        h = round(info["height"] * grab_scale) // 2 * 2
+        if w < 320 or h < 240:
+            return None
+        return (x, y, w, h)
+
+    def _probe_grab_scale(self):
+        """探测 ffmpeg gdigrab 的坐标体系：物理像素还是 DPI 虚拟化的逻辑像素。
+
+        先把本进程设为 DPI 感知拿到主屏物理宽度，再让 ffmpeg 抓一帧全屏，
+        对比抓出来的宽度：等于物理宽度说明 ffmpeg 按物理像素采集（乘显示
+        缩放），等于逻辑宽度说明被 DPI 虚拟化（乘 1）。探测失败按物理处理。
+        """
+        scale = os_display_scale()
+        if ctypes is None:
+            return scale
+        try:
+            phys_w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
+        except Exception:
+            return scale
+        probe = Path(os.environ.get("TEMP", ".")) / "_gdigrab_probe.png"
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-f", "gdigrab",
+                 "-i", "desktop", "-frames", "1", str(probe)],
+                capture_output=True, timeout=30)
+            with open(probe, "rb") as fh:
+                head = fh.read(24)
+            probe.unlink(missing_ok=True)
+            w = int.from_bytes(head[16:20], "big")
+            if abs(w - phys_w) <= 2:
+                return scale
+            if abs(w - round(phys_w / scale)) <= 2:
+                return 1.0
+        except Exception:
+            pass
+        log("⚠️ 无法确认 ffmpeg 屏幕坐标体系，按物理像素处理")
+        return scale
+
     def _record_viewmode(self, room_id):
         """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
 
@@ -435,7 +754,8 @@ class LiveRecorder:
             log("   请先安装 ffmpeg，或改用「纯净原始流」模式")
             return
         vx, vy, vw, vh = VIEW_WIN
-        log(f"观看视角模式：录制屏幕区域 ({vx},{vy}) {vw}x{vh}，画面含弹幕等界面元素")
+        grab_scale = self._probe_grab_scale()
+        log(f"观看视角模式：只录播放器画面（含弹幕），声音来自原始直播流")
         log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
         # 页面取消静音，和平时看直播一样（录制声音仍直接取自原始流，互不影响）
         try:
@@ -461,6 +781,7 @@ class LiveRecorder:
                     log("主播当前没在直播，每 60 秒刷新等待开播...")
                     wait_until = time.time() + 60
                     while time.time() < wait_until and not self._time_up():
+                        self._poll_stop()
                         time.sleep(2)
                     self._reopen_room()
                     continue
@@ -470,8 +791,19 @@ class LiveRecorder:
                 fails += 1
                 continue
 
+            # 每段录制前重新定位播放器（页面重开/布局变化后位置会变）
+            region = self._player_capture_rect(grab_scale)
+            if region:
+                vx, vy, vw, vh = region
+                log(f"已定位播放器区域：({vx},{vy}) {vw}x{vh}（不含浏览器标签栏/地址栏）")
+            else:
+                # VIEW_WIN 是窗口钉扎用的逻辑像素（DIP），同样要换算成 gdigrab 坐标
+                vx, vy, vw, vh = (int(v * grab_scale) // 2 * 2 for v in VIEW_WIN)
+                log(f"⚠️ 未能定位播放器，退回录制整窗区域 ({vx},{vy}) {vw}x{vh}")
+
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             mp4 = self.outdir / f"{room_id}_{stamp}_part{part}_观看视角.mp4"
+            self._finished.append(mp4)   # 先登记，任何退出路径统一收尾
             if self.t_start is None:
                 self.t_start = time.time()
                 if self.duration:
@@ -507,30 +839,29 @@ class LiveRecorder:
                         proc.kill()
 
             last_report = time.time()
-            while proc.poll() is None and not self._time_up():
-                time.sleep(3)
-                if mp4.exists() and time.time() - last_report >= 30:
-                    log(f"  录制中... {mp4.stat().st_size / 1048576:.1f} MB")
-                    last_report = time.time()
-                if self._live_ended():
-                    log("页面显示直播已结束，停止录制")
-                    break
-                self._check_captcha()
-            stop_ffmpeg()
+            try:
+                while proc.poll() is None and not self._time_up():
+                    time.sleep(3)
+                    if mp4.exists() and time.time() - last_report >= 30:
+                        log(f"  录制中... {mp4.stat().st_size / 1048576:.1f} MB")
+                        last_report = time.time()
+                    if self._live_ended():
+                        log("页面显示直播已结束，停止录制")
+                        break
+                    self._check_captcha()
+                    self._poll_stop()
+            finally:
+                stop_ffmpeg()   # 无论正常结束还是中断，都让 ffmpeg 写完 mp4 索引
 
             size = mp4.stat().st_size if mp4.exists() else 0
             if size >= 102400:
                 recorded += 1
                 log(f"  本段录制 {size / 1048576:.1f} MB")
-                part += 1
-                fails = 0
                 if self._time_up():
                     break
-                log("流断开了，尝试重连（主播下播的话会自动结束）...")
-                self._reopen_room()
-                if self._live_ended():
-                    log("主播已下播，结束录制")
-                    break
+                # 用户要求：流一断就收尾，不再找流重连
+                log("流断开了，直接收尾（按设定不再找流重连）")
+                break
             else:
                 if mp4.exists() and size < 10240:
                     mp4.unlink()
@@ -542,11 +873,6 @@ class LiveRecorder:
 
         if not recorded:
             log("观看视角没有录到任何内容，退出")
-            return
-        log("=" * 60)
-        log(f"观看视角录制完成！共 {recorded} 段，保存在: {self.outdir}")
-        log("画面含弹幕等界面元素（与网页观看一致），声音来自原始直播流")
-        log("=" * 60)
 
     # ---------- 主流程 ----------
 
@@ -573,9 +899,13 @@ class LiveRecorder:
         self.t_start = None
 
         self.start_browser()
-        finished = []
         try:
-            room_id = self.open_room(query)
+            if self._is_direct_room(query):
+                room_id = self.open_room(query)
+            else:
+                # 主页链接/分享文案：先等开播，解析出直播间再录
+                room_url = self._wait_for_live(query)
+                room_id = self.open_room(room_url)
             # 观看视角走独立流程（录屏幕画面，不下载原始流文件）
             if self.danmode == "view":
                 self._record_viewmode(room_id)
@@ -598,11 +928,8 @@ class LiveRecorder:
                             f"选用最高画质档（{tag}）")
 
                 if not url:
-                    # 已经录到内容：流断了且找不回来，大概率主播已下播。
-                    # 直接收尾转封装，不再反复找流干等（用户明确要求的行为）
-                    if finished:
-                        log("已录到的流中断后未能恢复，判定主播已下播，"
-                            "结束录制并收尾转封装")
+                    if self._finished:
+                        log("已录到的流中断后未能恢复，判定主播已下播，结束录制并收尾")
                         break
                     if self._looks_not_live():
                         log("主播当前没在直播。脚本会一直等，每 60 秒刷新检查，开播后自动开始录"
@@ -610,6 +937,7 @@ class LiveRecorder:
                                else "（可在网页界面点「停止」结束）"))
                         wait_until = time.time() + 60
                         while time.time() < wait_until and not self._time_up():
+                            self._poll_stop()
                             time.sleep(2)
                         self._reopen_room()
                         continue
@@ -631,6 +959,7 @@ class LiveRecorder:
                 # 录制只依赖拉流地址，页面切空白，停掉弹幕/动画/视频解码的开销
                 self._park_page()
                 raw = base.with_suffix(".flv" if kind == "flv" else ".mp4")
+                self._finished.append(raw)   # 先登记，任何退出路径统一收尾
                 try:
                     if kind == "flv":
                         size = self.record_flv(url, base)
@@ -648,47 +977,64 @@ class LiveRecorder:
 
                 if size >= 102400:
                     log(f"  本段录制 {size/1048576:.1f} MB")
-                    finished.append(raw)
                     fails = 0
                     part += 1
                     if self._time_up():
                         break
-                    log("流断开了，尝试自动重连（主播下播的话会自动结束录制）...")
-                    self._reopen_room()
-                    if self._live_ended():
-                        log("主播已下播（直播已结束），提前结束录制并收尾")
-                        break
+                    # 用户要求：流一断就收尾打包，不再找流重连
+                    log("流断开了，直接收尾转封装（按设定不再找流重连）")
+                    break
                 else:
                     if raw.exists() and raw.stat().st_size < 10240:
                         raw.unlink()
-                    if finished:
-                        # 本段几乎没录到数据且前面已有内容：流已断，直接收尾
+                    if self._finished:
                         log("本段没有录到有效数据，判定直播已结束，收尾转封装")
                         break
                     fails += 1
                     log(f"本段没有录到有效数据（{fails}/3），重试...")
 
-            # ------- 收尾：转封装 -------
-            if not finished:
+            if not self._finished:
                 log("没有录到任何内容，退出")
-                return
-            log("=" * 60)
-            log("录制结束，处理文件...")
-            final_files = []
-            for f in finished:
-                if f.suffix == ".flv":
-                    mp4 = flv_to_mp4(f)
-                    if mp4:
-                        log(f"  ✓ {mp4.name}（{mp4.stat().st_size/1048576:.1f} MB，已从 flv 无损转封装）")
-                        final_files.append(mp4)
-                        continue
-                final_files.append(f)
-                log(f"  ✓ {f.name}（{f.stat().st_size/1048576:.1f} MB）")
-            log(f"共 {len(final_files)} 个文件，保存在: {self.outdir}")
-            log("录制的是直播原始流：无弹幕、无评论、无在线人数、无任何界面元素")
-            log("=" * 60)
         finally:
+            # 任何退出路径（正常结束 / Ctrl+C / 界面停止 / 异常）都统一转封装收尾
             self.stop_browser()
+            self._finalize()
+
+
+def salvage_leftover_flv(outdir):
+    """崩溃兜底：把上次异常退出（进程被强杀/断电等）残留的 flv 转封装。
+
+    正常路径都会在 run() 的 finally 里收尾，但强杀/断电收不到任何信号，
+    这里在每次启动时扫描输出目录做补救；.part 半成品也一并改名转封装。
+    """
+    outdir = Path(outdir)
+    if not outdir.is_dir():
+        return
+    leftovers = sorted(outdir.glob("*.flv.part")) + sorted(outdir.glob("*.flv"))
+    if not leftovers:
+        return
+    log("=" * 60)
+    log(f"发现 {len(leftovers)} 个上次残留的录制文件，自动转封装收尾...")
+    for f in leftovers:
+        if f.suffix == ".part":
+            target = f.with_suffix("")   # xxx.flv.part -> xxx.flv
+            try:
+                f.rename(target)
+            except OSError as e:
+                log(f"  ✗ {f.name} 改名失败: {e}")
+                continue
+            f = target
+        if f.stat().st_size < 10240:
+            f.unlink()
+            log(f"  ✗ {f.name} 几乎是空的，已删除")
+            continue
+        mp4 = flv_to_mp4(f)
+        if mp4:
+            log(f"  ✓ {mp4.name}（{mp4.stat().st_size / 1048576:.1f} MB）")
+        else:
+            log(f"  ✗ {f.name} 转封装失败，原文件保留")
+    log("残留文件处理完毕")
+    log("=" * 60)
 
 
 def main():
@@ -708,6 +1054,9 @@ def main():
                         help="录制视角：clean=纯净原始流(无弹幕) view=观看视角(画面含弹幕，录屏)")
     args = parser.parse_args()
 
+    # 崩溃兜底：先处理上次异常退出残留的录制文件（定时任务也不受影响）
+    salvage_leftover_flv(args.outdir)
+
     query = args.url or args.room
     if not query:
         if not INTERACTIVE:
@@ -716,7 +1065,8 @@ def main():
         print("=" * 60)
         print("抖音直播录制器（录制纯净画面，无弹幕/评论/人数等 UI）")
         print("=" * 60)
-        query = input("请输入直播间链接或房间号: ").strip()
+        print("提示：直播间还没开播时可填主播主页链接或 App 分享文案，开播自动找到直播间")
+        query = input("请输入直播间链接/房间号/主播主页链接: ").strip()
         if not query:
             print("未输入，退出")
             sys.exit(1)
@@ -759,6 +1109,12 @@ def main():
         log("未提供 cookies：将以未登录状态尝试录制（部分直播可能受限）")
     log(f"cookies 解析出 {len(cookies)} 个字段")
 
+    # 清掉上次可能残留的停止标记（避免一启动就被误判为要停止）
+    try:
+        _STOP_FLAG.unlink(missing_ok=True)
+    except Exception:
+        pass
+
     recorder = LiveRecorder(cookies, args.outdir,
                             duration=(args.minutes or 0) * 60,
                             headless=args.headless, start_ts=start_ts,
@@ -767,7 +1123,7 @@ def main():
         recorder.run(query)
     except KeyboardInterrupt:
         print()
-        log("手动停止。正在收尾（浏览器已关，文件保留），重新运行脚本即可再次录制")
+        log("手动停止。已录片段已收尾转封装，文件保留在输出目录")
 
 
 if __name__ == "__main__":

@@ -39,16 +39,29 @@ class Runner:
         self.stopped = False   # 是否被「停止」按钮终止（用于状态展示）
         self.cookie_tmp = None
         self._pending = []   # 批量模式下排队等待的命令列表
+        self.mode = None     # 当前任务类型（live 任务点「停止」走优雅收尾）
+        self._dropped = 0    # 日志缓冲因超上限丢弃的头部行数（逻辑序号补偿）
+
+    MAX_LOG_LINES = 3000   # 日志缓冲上限，防止长时间任务内存无限增长
+
+    def _push_line(self, text):
+        self.log_lines.append(text)
+        if len(self.log_lines) > self.MAX_LOG_LINES:
+            drop = len(self.log_lines) - self.MAX_LOG_LINES
+            del self.log_lines[:drop]
+            self._dropped += drop
 
     def log(self, msg):
         with self.lock:
-            self.log_lines.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+            self._push_line(f"[{time.strftime('%H:%M:%S')}] {msg}")
 
     def state(self, after):
         with self.lock:
+            # after 是客户端已消费的逻辑行数；头部被丢弃后要补偿
+            start = max(after - self._dropped, 0)
             return {
-                "lines": self.log_lines[after:],
-                "total": len(self.log_lines),
+                "lines": self.log_lines[start:],
+                "total": self._dropped + len(self.log_lines),
                 "running": self.running,
                 "exit_code": self.exit_code,
                 "stopped": self.stopped,
@@ -66,6 +79,7 @@ class Runner:
         if mode == "login":
             with self.lock:
                 self.log_lines = []
+                self._dropped = 0
                 self.exit_code = None
                 self.running = True
                 self.stopped = False
@@ -195,9 +209,11 @@ class Runner:
 
         with self.lock:
             self.log_lines = []
+            self._dropped = 0
             self.exit_code = None
             self.running = True
             self.stopped = False
+            self.mode = mode
             self._pending = cmds[1:]
         if desc:
             self.log(f"启动{desc}")
@@ -224,7 +240,7 @@ class Runner:
             proc = self.proc
             for line in proc.stdout:
                 with self.lock:
-                    self.log_lines.append(line.rstrip("\r\n"))
+                    self._push_line(line.rstrip("\r\n"))
             code = proc.wait()
             with self.lock:
                 nxt = self._pending.pop(0) if self._pending else None
@@ -249,9 +265,28 @@ class Runner:
             pid = self.proc.pid
             self.stopped = True
             self._pending = []   # 批量队列一并取消
-        # Windows 下终止整棵进程树（含 chromium）
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                       capture_output=True)
+            is_live = (self.mode == "live")
+        if is_live:
+            # 直播录制走优雅停止：放标记文件，录制器轮询到后自己收尾
+            # （转封装已录片段）再退出；卡死超时才强杀进程树
+            try:
+                (BASE_DIR / "stop.flag").write_text("stop", encoding="utf-8")
+            except Exception:
+                pass
+
+            def _force_kill():
+                try:
+                    if self.proc and self.proc.poll() is None:
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                                       capture_output=True)
+                except Exception:
+                    pass
+
+            threading.Timer(90, _force_kill).start()
+        else:
+            # 爬虫任务没有收尾需求，直接终止整棵进程树（含 chromium）
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           capture_output=True)
         return None
 
 
@@ -716,7 +751,7 @@ function onMode() {
     single:   ["视频链接 / App 分享文案", "粘贴视频链接或分享文案，如 https://v.douyin.com/xxxx/", "数量限制", "1"],
     search:   ["搜索关键词", "如：家常菜、篮球教程、旅行 vlog（若弹验证请在浏览器窗口手动完成）", "数量限制", "全部"],
     comments: ["视频链接 / App 分享文案", "粘贴视频链接，评论将导出为 CSV", "评论数量上限", "全部"],
-    live:     ["直播间链接或房间号", "如 https://live.douyin.com/123456 或纯数字房间号", "录制时长（分钟，留空=不限）", "不限"],
+    live:     ["直播间链接 / 房间号 / 主播主页链接", "开播中：https://live.douyin.com/123456 或纯数字房间号&#10;未开播（定时录）：主播主页链接 https://www.douyin.com/user/... 或 App 分享文案，到点自动等开播", "录制时长（分钟，留空=不限）", "不限"],
     batch:    ["", "", "每个任务的数量限制", "全部"]
   }[m] || ["目标", "", "数量限制", "全部"];
   $("queryLabel").textContent = labels[0];

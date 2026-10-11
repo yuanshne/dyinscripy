@@ -166,7 +166,7 @@ class DouyinSpider:
         self.has_more = True
         self.profile = None      # 用户资料 dict
         # 评论抓取状态
-        self.comments = []           # 按接口返回顺序的原始评论 dict
+        self.comments = []           # 按接口返回顺序的评论（只留 CSV 所需字段）
         self._comment_seen = set()   # 已收到的 cid
         self._pending_comment_resps = []  # 回调线程入队、主线程解析的评论响应
         self.comment_has_more = True
@@ -312,7 +312,9 @@ class DouyinSpider:
                 cid = c.get("cid")
                 if cid and cid not in self._comment_seen:
                     self._comment_seen.add(cid)
-                    self.comments.append(c)
+                    # 采集时就压缩成 CSV 所需字段：原始评论 dict 含用户资料等，
+                    # 每条几 KB，几万条评论会累积上百 MB 内存
+                    self.comments.append(self.summarize_comment(c))
             if data.get("has_more") in (0, False, "0"):
                 self.comment_has_more = False
 
@@ -957,10 +959,35 @@ class DouyinSpider:
                 log("评论接口没有返回数据（cookies 失效 / 视频无评论 / 页面结构变化），退出")
                 return
 
+            # 边抓边写盘：新评论随时追加进临时 CSV，中途崩溃/停止不丢已抓数据；
+            # comments 里已是压缩过的行 dict，直接写，不要再做二次转换
+            csv_dir = self.outdir / "comments"
+            csv_dir.mkdir(exist_ok=True)
+            tmp_csv = csv_dir / f"评论_{vid}_进行中.csv"
+            tmp_csv.unlink(missing_ok=True)   # 清掉上次可能残留的进行中文件
+            written = 0
+
+            def _flush_new():
+                """把新增评论追加写入临时 CSV（表头在文件为空时写入）"""
+                nonlocal written
+                cap = self.limit if self.limit else None
+                new = self.comments[written:cap]
+                if not new:
+                    return
+                with open(tmp_csv, "a", newline="", encoding="utf-8-sig") as f:
+                    w = csv.DictWriter(f, fieldnames=list(new[0].keys()))
+                    if f.tell() == 0:
+                        w.writeheader()
+                    w.writerows(new)
+                written += len(new)
+
+            _flush_new()   # 首批评论先落盘
+
             # 滚动加载更多
             last_n, stable = -1, 0
             while True:
                 self._drain_comments()
+                _flush_new()
                 if self.limit and len(self.comments) >= self.limit:
                     log(f"已达 --limit {self.limit}，停止收集")
                     break
@@ -984,15 +1011,13 @@ class DouyinSpider:
 
             if self.limit:
                 self.comments = self.comments[:self.limit]
-            rows = [self.summarize_comment(c) for c in self.comments]
-            rows.sort(key=lambda r: (r["点赞"] or 0), reverse=True)
-            outdir = self.outdir / "comments"
-            outdir.mkdir(exist_ok=True)
-            csv_path = outdir / f"评论_{vid}_{len(rows)}条.csv"
+            rows = sorted(self.comments, key=lambda r: (r["点赞"] or 0), reverse=True)
+            csv_path = csv_dir / f"评论_{vid}_{len(rows)}条.csv"
             with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
                 w.writeheader()
                 w.writerows(rows)
+            tmp_csv.unlink(missing_ok=True)
             log("=" * 60)
             log(f"评论抓取完成: 共 {len(rows)} 条（按点赞数排序）")
             log(f"  保存位置: {csv_path}")
