@@ -39,12 +39,17 @@ import shutil
 import subprocess
 import sys
 import time
-import random
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import requests
-from playwright.sync_api import sync_playwright
+try:
+    import requests
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print("缺少运行依赖：playwright / requests")
+    print("请双击「打开爬虫界面.bat」，它会自动帮你安装；")
+    print("或手动执行: pip install requests playwright && playwright install chromium")
+    sys.exit(1)
 
 # 与浏览器保持一致的 UA（拉流时也用同一个，降低风控概率）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -142,7 +147,7 @@ def flv_to_mp4(flv_path):
     if r.returncode == 0 and mp4.exists() and mp4.stat().st_size > 10240:
         flv_path.unlink()
         return mp4
-    log(f"  ffmpeg 转封装失败，保留原 .flv 文件")
+    log("  ffmpeg 转封装失败，保留原 .flv 文件")
     return None
 
 
@@ -384,7 +389,7 @@ class LiveRecorder:
     def record_m3u8(self, url, base_path):
         """兜底：只有 hls 流且本机有 ffmpeg 时，直接用 ffmpeg 录成 mp4"""
         mp4 = base_path.with_suffix(".mp4")
-        headers = f"Referer: https://live.douyin.com/\r\n"
+        headers = "Referer: https://live.douyin.com/\r\n"
         cmd = ["ffmpeg", "-y", "-loglevel", "error",
                "-user_agent", UA, "-headers", headers,
                "-i", url, "-c", "copy", "-bsf:a", "aac_adtstoasc", str(mp4)]
@@ -588,7 +593,14 @@ def main():
         if default.exists():
             cookie_file = str(default)
 
-    cookies = load_cookies(args.cookie, cookie_file)
+    # 未登录也能录制大部分直播，所以 cookie 缺失只提示、不退出
+    if args.cookie:
+        cookies = load_cookies(args.cookie, None)
+    elif cookie_file:
+        cookies = load_cookies(None, cookie_file)
+    else:
+        cookies = {}
+        log("未提供 cookies：将以未登录状态尝试录制（部分直播可能受限）")
     log(f"cookies 解析出 {len(cookies)} 个字段")
 
     recorder = LiveRecorder(cookies, args.outdir,

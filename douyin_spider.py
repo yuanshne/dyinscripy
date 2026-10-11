@@ -31,8 +31,14 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
-import requests
-from playwright.sync_api import sync_playwright
+try:
+    import requests
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    print("缺少运行依赖：playwright / requests")
+    print("请双击「打开爬虫界面.bat」，它会自动帮你安装；")
+    print("或手动执行: pip install requests playwright && playwright install chromium")
+    sys.exit(1)
 
 # 与浏览器保持一致的 UA（下载视频/图片时也要用同一个，降低风控概率）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -416,10 +422,10 @@ class DouyinSpider:
             nick = self.profile.get("nickname") or ""
             log(f"  候选 {i}: @{uid}（{nick}）")
             if uid == account:
-                log(f"  ✅ 抖音号精确匹配")
+                log("  ✅ 抖音号精确匹配")
                 return self.profile
             if nick == account:
-                log(f"  ✅ 昵称匹配")
+                log("  ✅ 昵称匹配")
                 return self.profile
 
         if fallback:

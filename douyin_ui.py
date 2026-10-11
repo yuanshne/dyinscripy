@@ -99,6 +99,7 @@ class Runner:
             outdir_arg = ["--outdir", str(od)]
 
         # cookie：网页粘贴的优先，否则用同目录 cookies.txt
+        # （直播录制未登录也能录大部分直播间，cookie 缺失只提示、不放行报错）
         cookie_path = None
         if (cookie_text or "").strip():
             self.cookie_tmp = Path(os.environ.get("TEMP", str(BASE_DIR))) / "douyin_ui_cookie.txt"
@@ -108,8 +109,8 @@ class Runner:
             default_cookie = BASE_DIR / "cookies.txt"
             if default_cookie.exists():
                 cookie_path = default_cookie
-            else:
-                return "未提供 cookie，且同目录下没有 cookies.txt"
+            elif mode != "live":
+                return "未提供 cookie，且同目录下没有 cookies.txt（直播录制可忽略此项直接开始）"
 
         limit_n = None
         if (limit or "").strip():
@@ -672,6 +673,7 @@ let cursor = 0;
 
 // 搜索排序：general=综合排序 / most_like=点赞最多，选择持久化
 let searchSort = localStorage.getItem("dy_sort") || "general";
+if (searchSort !== "general" && searchSort !== "most_like") searchSort = "general";
 
 function setSort(s) {
   searchSort = s;
