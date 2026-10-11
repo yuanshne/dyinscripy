@@ -237,7 +237,7 @@ class Runner:
                 return "录制视角参数不合法"
             if (start_at or "").strip():
                 sa = start_at.strip()
-                if not re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?|\d{4}-\d{2}-\d{2} \d{1,2}:\d{2}(:\d{2})?", sa):
+                if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?|\d{4}-\d{2}-\d{2} (?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", sa):
                     return "定时开始格式不对：请填 20:00 或 2026-10-11 20:00"
                 cmd += ["--start", sa]
             if limit_n:
