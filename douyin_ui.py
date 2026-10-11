@@ -55,7 +55,7 @@ class Runner:
             }
 
     def start(self, mode, query, cookie_text, limit, since=None, until=None,
-              start_at=None, batch_type=None, outdir=None):
+              start_at=None, batch_type=None, outdir=None, sort=None):
         with self.lock:
             if self.running:
                 return "已有任务在运行，请先停止或等待完成"
@@ -117,6 +117,13 @@ class Runner:
             if limit_n is None:
                 return "数量/时长必须是数字"
 
+        # 搜索排序：general=综合排序(0) / most_like=点赞最多(2)，已实测参数回显生效
+        sort_arg = []
+        if sort == "most_like":
+            sort_arg = ["--sort", "most_like"]
+        elif sort not in (None, "", "general"):
+            return "排序参数不合法"
+
         spider = str(BASE_DIR / "douyin_spider.py")
         recorder = str(BASE_DIR / "douyin_live_recorder.py")
 
@@ -147,7 +154,7 @@ class Runner:
                 if bt == "single":
                     c += ["--video", ln]
                 elif bt == "search":
-                    c += ["--search", ln]
+                    c += ["--search", ln] + sort_arg
                 elif bt == "comments":
                     c += ["--comments", ln]
                 else:
@@ -168,7 +175,7 @@ class Runner:
             elif mode == "comments":
                 cmd += ["--comments", query]
             elif mode == "search":
-                cmd += ["--search", query]
+                cmd += ["--search", query] + sort_arg
             else:
                 flag = "--url" if ("douyin.com" in query or "MS4wLjAB" in query) else "--account"
                 cmd += [flag, query]
@@ -485,6 +492,9 @@ PAGE = """<!DOCTYPE html>
   #btnLogin { background: #fff; border: 1px solid rgba(0,161,214,.55); color: var(--blue); padding: 9px 20px; }
   #btnLogin:hover:not(:disabled) { background: rgba(0,161,214,.08); }
   #btnLogin:disabled { opacity: .5; cursor: not-allowed; }
+  .sortbtn { background: #fff; border: 1px solid var(--line); color: var(--dim); padding: 8px 18px; }
+  .sortbtn:hover { border-color: rgba(0,161,214,.7); color: var(--blue); }
+  .sortbtn.active { background: var(--pink); border-color: var(--pink); color: #fff; }
   #limit { width: 120px; }
   .hint { color: var(--dim); font-size: 12px; }
 
@@ -568,15 +578,22 @@ PAGE = """<!DOCTYPE html>
     <label id="queryLabel">目标（抖音号 / 主页链接 / App 分享文案）</label>
     <input type="text" id="query" placeholder="例如：27285332742 或 https://v.douyin.com/xxxx/">
 
+    <div id="sortRow" style="display:none; align-items:center; gap:8px; margin-top:10px; flex-wrap:wrap">
+      <label style="margin:0">搜索结果排序</label>
+      <button type="button" id="sortGeneral" class="sortbtn" onclick="setSort('general')">综合排序</button>
+      <button type="button" id="sortLike" class="sortbtn" onclick="setSort('most_like')">点赞最多</button>
+    </div>
+
     <div id="searchTip" style="display:none; margin-top:8px; padding:10px 12px;
          border-radius:8px; background:#fff8e6; border:1px solid #ffd591;
          font-size:13px; line-height:1.7; color:#8c6d1f">
       <b>搜索模式工作方式（请先读一遍）：</b><br>
-      ① 点开始后会弹出浏览器，自动打开搜索结果页并滚动收集视频；<br>
-      ② 搜索页<b>大概率触发平台安全验证</b>（如点选相同图案），脚本不会也无法替你绕过——
+      ① 用上面的按钮选排序：综合排序（默认）/ 点赞最多；<br>
+      ② 点开始后会弹出浏览器，自动打开搜索结果页并滚动收集视频；<br>
+      ③ 搜索页<b>大概率触发平台安全验证</b>（如点选相同图案），脚本不会也无法替你绕过——
       它会自动暂停等待，<b>请你直接在那个弹出的浏览器窗口里手动完成验证</b>；<br>
-      ③ 完成后无需任何操作，脚本检测到验证解除会自动继续收集并下载；<br>
-      ④ 约一半概率需要手动过一次验证，属正常现象，多试几个词即可。
+      ④ 完成后无需任何操作，脚本检测到验证解除会自动继续收集并下载；<br>
+      ⑤ 约一半概率需要手动过一次验证，属正常现象，多试几个词即可。
     </div>
 
     <div id="dateRow" style="display:flex; gap:12px; margin-top:2px; flex-wrap:wrap;">
@@ -653,12 +670,28 @@ PAGE = """<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let cursor = 0;
 
+// 搜索排序：general=综合排序 / most_like=点赞最多，选择持久化
+let searchSort = localStorage.getItem("dy_sort") || "general";
+
+function setSort(s) {
+  searchSort = s;
+  localStorage.setItem("dy_sort", s);
+  paintSort();
+}
+
+function paintSort() {
+  $("sortGeneral").classList.toggle("active", searchSort === "general");
+  $("sortLike").classList.toggle("active", searchSort === "most_like");
+}
+
 function onMode() {
   const m = $("mode").value;
   $("dateRow").style.display = m === "user" ? "flex" : "none";
   $("liveRow").style.display = m === "live" ? "block" : "none";
   $("batchRow").style.display = m === "batch" ? "block" : "none";
-  $("searchTip").style.display = (m === "search" || (m === "batch" && $("batchType").value === "search")) ? "block" : "none";
+  const showSort = m === "search" || (m === "batch" && $("batchType").value === "search");
+  $("sortRow").style.display = showSort ? "flex" : "none";
+  $("searchTip").style.display = showSort ? "block" : "none";
   const isBatch = m === "batch";
   $("queryLabel").style.display = isBatch ? "none" : "block";
   $("query").style.display = isBatch ? "none" : "block";
@@ -704,7 +737,8 @@ async function start() {
     until: $("until").value,
     startat: $("startat").value,
     batchType: $("batchType").value,
-    outdir: $("outdir").value
+    outdir: $("outdir").value,
+    sort: searchSort
   });
   if (res.error) { setStatus(res.error, "err"); }
   else { $("logbox").textContent = ""; cursor = 0; poll(); }
@@ -801,6 +835,7 @@ refreshCookie();
   if (sm) { $("mode").value = sm; }
   if (so) { $("outdir").value = so; }
   onMode();
+  paintSort();
 })();
 
 // 存储位置输入完立即记住，刷新/下次打开不用重填
@@ -844,7 +879,8 @@ class Handler(BaseHTTPRequestHandler):
                                data.get("cookie"), data.get("limit"),
                                data.get("since"), data.get("until"),
                                data.get("startat"),
-                               data.get("batchType"), data.get("outdir"))
+                               data.get("batchType"), data.get("outdir"),
+                               data.get("sort"))
             self._send(200, json.dumps({"error": err}, ensure_ascii=False))
         elif self.path == "/login":
             err = runner.start("login", None, None, None)

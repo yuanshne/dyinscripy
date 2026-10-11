@@ -794,11 +794,14 @@ class DouyinSpider:
 
     # ---------- 关键词搜索模式 ----------
 
-    def run_search(self, query):
+    def run_search(self, query, sort="general"):
         """关键词搜索模式。
 
         工作方式：打开搜索结果页自动滚动收集，结果页卡片里混着直播/商品等
         推广卡，只收带可下载视频地址的条目。
+        排序：general=综合排序(sort_type=0) / most_like=点赞最多(sort_type=2)。
+        实测 URL 带 sort_type 时页面发出的搜索接口请求会原样回显该参数，
+        说明排序参数被页面识别；sort_field 则会被忽略。
         重要：搜索页大概率触发平台安全验证（点选/滑块），脚本不会也无法
         自动绕过——检测到验证会停下等待，请在弹出的浏览器窗口里手动完成，
         脚本检测到验证解除后自动继续收集。
@@ -806,8 +809,12 @@ class DouyinSpider:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.start_browser()
         try:
-            url = f"https://www.douyin.com/search/{quote(query)}?type=video"
-            log(f"打开搜索页: {url}")
+            # 综合排序=0，点赞最多=2（页面请求回显验证过）
+            st = "2" if sort == "most_like" else "0"
+            sort_name = "点赞最多" if sort == "most_like" else "综合排序"
+            url = (f"https://www.douyin.com/search/{quote(query)}"
+                   f"?type=video&sort_type={st}")
+            log(f"打开搜索页（排序：{sort_name}）: {url}")
             log("搜索模式：若浏览器里弹出安全验证，请手动完成，"
                 "脚本检测到验证解除后会自动继续")
             self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -996,6 +1003,8 @@ def main():
     parser.add_argument("--url", help="或：用户主页链接（含 sec_uid）")
     parser.add_argument("--video", help="或：单个视频链接/分享文案")
     parser.add_argument("--search", help="或：关键词搜索（弹验证时需在浏览器窗口手动完成）")
+    parser.add_argument("--sort", choices=["general", "most_like"], default="general",
+                        help="搜索结果排序：general=综合排序（默认），most_like=点赞最多")
     parser.add_argument("--comments", help="或：抓取该视频的评论，导出 CSV（视频链接/分享文案）")
     parser.add_argument("--cookie", help="整串 cookie 字符串")
     parser.add_argument("--cookie-file", help="或：cookie 文件路径（文件里粘贴整串 cookie）")
@@ -1038,7 +1047,7 @@ def main():
                           limit=args.limit, since=args.since, until=args.until)
     try:
         if args.search:
-            spider.run_search(args.search)
+            spider.run_search(args.search, sort=args.sort)
         elif args.video:
             spider.run_single(args.video)
         elif args.comments:
