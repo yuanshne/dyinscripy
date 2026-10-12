@@ -656,7 +656,8 @@ class DouyinSpider:
             f"图片 {sum(1 for t in dl if t['type']=='图片')}）")
 
         done = 0
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        # 并发压到 2：下载请求也带 cookie，宁可慢一点也别触发风控
+        with ThreadPoolExecutor(max_workers=2) as pool:
             futures = {}
             for t in dl:
                 futures[pool.submit(self._download_one, t["url"], t["path"], session)] = t

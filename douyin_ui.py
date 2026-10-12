@@ -154,7 +154,8 @@ class Runner:
             }
 
     def start(self, mode, query, cookie_text, limit, since=None, until=None,
-              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None):
+              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None,
+              quality=None):
         with self.lock:
             if self.running:
                 return "已有任务在运行，请先停止或等待完成"
@@ -236,6 +237,11 @@ class Runner:
                 cmd += ["--danmode", "view"]
             elif danmode not in (None, "", "clean"):
                 return "录制视角参数不合法"
+            # 录制画质：origin=原画（默认） super=超清 high=高清 standard=标清
+            if quality not in (None, "", "origin"):
+                if quality not in ("super", "high", "standard"):
+                    return "画质参数不合法"
+                cmd += ["--quality", quality]
             if (start_at or "").strip():
                 sa = start_at.strip()
                 if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?|\d{4}-\d{2}-\d{2} (?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", sa):
@@ -737,7 +743,14 @@ PAGE = """<!DOCTYPE html>
         <option value="clean">纯净原始流（无弹幕，原画质）</option>
         <option value="view">观看视角（画面含弹幕，录屏+原声）</option>
       </select>
-      <div class="hint" style="margin-top:4px">观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口，也不要在该窗口里做任何操作（点击、滚动、切换标签页都会被录进去并导致画面晃动/丢失）；画质为播放分辨率，ffmpeg 首次运行时自动安装。</div>
+      <label style="margin-top:10px">录制画质（两种视角都生效）</label>
+      <select id="quality">
+        <option value="origin">原画（推荐）</option>
+        <option value="super">超清</option>
+        <option value="high">高清</option>
+        <option value="standard">标清</option>
+      </select>
+      <div class="hint" style="margin-top:4px">直播间没有所选档位时自动就近回落。观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口，也不要在该窗口里做任何操作（点击、滚动、切换标签页都会被录进去并导致画面晃动/丢失）；画质为播放分辨率，ffmpeg 首次运行时自动安装。</div>
       <label style="margin-top:10px">定时开始（如 20:00 或 2026-10-11 20:00，留空 = 立即开始）</label>
       <input type="text" id="startat" placeholder="主播没开播会自动等待，开播即录">
     </div>
@@ -870,7 +883,8 @@ async function start() {
     batchType: $("batchType").value,
     outdir: $("outdir").value,
     sort: searchSort,
-    danmode: $("danmode") ? $("danmode").value : "clean"
+    danmode: $("danmode") ? $("danmode").value : "clean",
+    quality: $("quality") ? $("quality").value : "origin"
   });
   if (res.error) { setStatus(res.error, "err"); }
   else { $("logbox").textContent = ""; cursor = 0; poll(); }
@@ -1012,7 +1026,8 @@ class Handler(BaseHTTPRequestHandler):
                                data.get("since"), data.get("until"),
                                data.get("startat"),
                                data.get("batchType"), data.get("outdir"),
-                               data.get("sort"), data.get("danmode"))
+                               data.get("sort"), data.get("danmode"),
+                               data.get("quality"))
             self._send(200, json.dumps({"error": err}, ensure_ascii=False))
         elif self.path == "/login":
             err = runner.start("login", None, None, None)

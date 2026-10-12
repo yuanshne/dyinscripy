@@ -35,6 +35,8 @@ a.datas += [
     (os.path.join(dest, os.path.basename(src)), src, "DATA")
     for (src, dest) in collect_data_files("imageio_ffmpeg")
 ]
+# 包内使用说明（轻量版/完整版通用）
+a.datas += [("使用说明.txt", "包内使用说明.txt", "DATA")]
 
 pyz = PYZ(a.pure)
 

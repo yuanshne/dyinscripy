@@ -217,15 +217,26 @@ def flv_to_mp4(flv_path):
     return None
 
 
+# 清晰度选择：flv_pull_url 里的档位键（FULL_HD1=原画 HD1=超清 SD1=高清 SD2=标清），
+# 首选档缺失时按列表顺序就近回落
+QUALITY_KEYS = {
+    "origin":   ["FULL_HD1", "HD1", "SD1", "SD2"],
+    "super":    ["HD1", "FULL_HD1", "SD1", "SD2"],
+    "high":     ["SD1", "HD1", "FULL_HD1", "SD2"],
+    "standard": ["SD2", "SD1", "HD1", "FULL_HD1"],
+}
+
+
 class LiveRecorder:
     def __init__(self, cookies, outdir, duration=0, headless=False, start_ts=None,
-                 danmode="clean"):
+                 danmode="clean", quality="origin"):
         self.cookies = cookies
         self.outdir = Path(outdir)
         self.duration = duration      # 最长录制秒数，0 = 不限
         self.headless = headless
         self.start_ts = start_ts      # 定时开始的时间戳，None = 立即开始
         self.danmode = danmode or "clean"   # clean=纯净原始流 / view=观看视角(含弹幕)
+        self.quality = quality if quality in QUALITY_KEYS else "origin"
 
         self.stream_url = None        # 拦截到的拉流地址
         self.stream_kind = None       # "flv" / "m3u8"
@@ -339,7 +350,7 @@ class LiveRecorder:
 
         return sorted(out, key=rank)
 
-    # 播放器 store 里的分档拉流地址：FULL_HD1=原画，播放器画面默认放的是标清
+    # 播放器 store 里的分档拉流地址表（键见 QUALITY_KEYS）
     _STORE_FLV_JS = """
 () => {
   try {
@@ -349,19 +360,24 @@ class LiveRecorder:
                   && info.room.stream_url.flv_pull_url)
                  || (info && info.web_stream_url && info.web_stream_url.flv_pull_url)
                  || null;
-    if (!urls) return null;
-    return urls.FULL_HD1 || urls.HD1 || urls.SD1 || urls.SD2 || null;
+    return urls || null;
   } catch (e) { return null; }
 }
 """
 
     def _stream_from_store(self):
-        """从播放器数据直取最高档（原画）flv 地址，拿不到返回 None"""
+        """从播放器数据直取所选档位的 flv 地址（缺档就近回落），拿不到返回 None"""
         try:
-            u = self._page.evaluate(self._STORE_FLV_JS)
+            urls = self._page.evaluate(self._STORE_FLV_JS)
         except Exception:
             return None
-        return u if (u and ".flv?" in u) else None
+        if not isinstance(urls, dict):
+            return None
+        for key in QUALITY_KEYS.get(self.quality, QUALITY_KEYS["origin"]):
+            u = urls.get(key)
+            if u and ".flv?" in u:
+                return u
+        return None
 
     # ---------- 直播间 ----------
 
@@ -877,7 +893,13 @@ class LiveRecorder:
                 return
             self._page.mouse.move(cur["x"], cur["y"])
             time.sleep(0.8)
-            for tier in ("原画", "蓝光", "超清"):
+            # 按所选档位优先点击，缺档时向更高档回落、再向低档回落
+            tiers = {"origin": ["原画", "蓝光", "超清"],
+                     "super": ["超清", "蓝光", "原画"],
+                     "high": ["高清", "超清", "蓝光", "原画"],
+                     "standard": ["标清", "高清", "超清", "蓝光", "原画"]
+                     }.get(self.quality, ["原画", "蓝光", "超清"])
+            for tier in tiers:
                 r = self._page.evaluate(self._TIER_RECT_JS, tier)
                 if r:
                     self._page.mouse.move(r["x"], r["y"])
@@ -1264,6 +1286,9 @@ def main():
                         help="录制视角：clean=纯净原始流(无弹幕) view=观看视角(画面含弹幕，录屏)")
     parser.add_argument("--selftest", action="store_true",
                         help="快速自检：ffmpeg/屏幕采集/cookies/网络是否可用（不录）")
+    parser.add_argument("--quality", choices=["origin", "super", "high", "standard"],
+                        default="origin",
+                        help="录制画质（默认 origin=原画）：super=超清 high=高清 standard=标清")
     args = parser.parse_args()
     if args.selftest:
         sys.exit(0 if _selftest() else 1)
@@ -1332,7 +1357,7 @@ def main():
     recorder = LiveRecorder(cookies, args.outdir,
                             duration=(args.minutes or 0) * 60,
                             headless=args.headless, start_ts=start_ts,
-                            danmode=args.danmode)
+                            danmode=args.danmode, quality=args.quality)
     try:
         recorder.run(query)
     except KeyboardInterrupt:
