@@ -103,6 +103,16 @@ def safe_name(s, maxlen=40):
     return (s[:maxlen] or "无标题")
 
 
+def _best_video_url(video):
+    """从 bit_rate 多档里选码率最高的一档，拿不到返回 None（调用方退回默认档）"""
+    rates = [br for br in (video.get("bit_rate") or [])
+             if (br.get("play_addr") or {}).get("url_list")]
+    if not rates:
+        return None
+    best = max(rates, key=lambda br: br.get("bit_rate") or 0)
+    return best["play_addr"]["url_list"][0]
+
+
 def parse_cookie_string(raw):
     """把浏览器复制的整串 cookie（'k=v; k2=v2'）解析成 dict"""
     raw = raw.strip().strip('"').strip("'")
@@ -617,7 +627,8 @@ class DouyinSpider:
                     tasks.append({"type": "图片", "url": url, "path": path, "aweme": aw,
                                   "files": [path], "fallback": None})
             elif video.get("play_addr", {}).get("url_list"):
-                url = video["play_addr"]["url_list"][0]
+                # 从多档码率里选最高档（默认 play_addr 往往是中低档，看着比 App 糊）
+                url = _best_video_url(video) or video["play_addr"]["url_list"][0]
                 path = self.videos_dir / f"{base}.mp4"
                 fallback_url = ((video.get("download_addr") or {}).get("url_list") or [None])[0]
                 tasks.append({"type": "视频", "url": url, "path": path, "aweme": aw,
