@@ -81,8 +81,19 @@ INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
                and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
 
 
+_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+
+
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # 同时落盘到 logs/日期.log，事后可查（界面内存日志关掉就没了）
+    try:
+        _LOG_FILE.parent.mkdir(exist_ok=True)
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def pause(msg):
@@ -859,6 +870,11 @@ class DouyinSpider:
                         break
                 else:
                     stable = 0
+                    # 每多收集 10 个作品随机歇一会，降低请求密度防风控
+                    if n // 10 > last_n // 10:
+                        rest = random.uniform(5, 10)
+                        log(f"  已收集 {n} 个，歇 {rest:.0f} 秒降低请求密度...")
+                        time.sleep(rest)
                     last_n = n
                     log(f"已收集 {n} 个搜索结果...")
                 # 真实鼠标滚轮滚动加载更多（与探测脚本同款，实测有效）
@@ -1017,6 +1033,11 @@ class DouyinSpider:
                         break
                 else:
                     stable = 0
+                    # 每多收集 50 条评论随机歇一会，降低请求密度防风控
+                    if last_n >= 0 and len(self.comments) // 50 > last_n // 50:
+                        rest = random.uniform(4, 8)
+                        log(f"  已收集 {len(self.comments)} 条，歇 {rest:.0f} 秒降低请求密度...")
+                        time.sleep(rest)
                     log(f"  已收集 {len(self.comments)} 条评论")
                 last_n = len(self.comments)
 
@@ -1039,6 +1060,62 @@ class DouyinSpider:
 
 # ---------------------------------------------------------------- 命令行入口
 
+def _selftest():
+    """快速自检：依赖 / cookies / 网络 / 页面结构是否兼容（不跑完整任务）。
+
+    抖音改版后先跑这个，能快速分辨「环境坏了」还是「页面结构变了」。
+    """
+    ok = True
+
+    def report(name, good, detail=""):
+        nonlocal ok
+        ok = ok and good
+        log(f"{'✅' if good else '❌'} {name}{('：' + detail) if detail else ''}")
+
+    # 1. Python 依赖
+    try:
+        import playwright.sync_api  # noqa: F401
+        import requests  # noqa: F401
+        report("Python 依赖（playwright / requests）", True)
+    except Exception as e:
+        report("Python 依赖", False, f"{e}（重跑「打开爬虫界面.bat」自动安装）")
+        return ok
+
+    # 2. cookies
+    ck = Path(__file__).parent / "cookies.txt"
+    good = ck.exists() and ck.stat().st_size > 50
+    report("cookies 文件", good,
+           str(ck) if good else f"缺失（{ck}），先运行 douyin_login.py 登录")
+    if not good:
+        return ok
+
+    # 3. 浏览器内核 + 网络 + 页面结构探测
+    raw = ck.read_text(encoding="utf-8").strip()
+    cookie_str = max(raw.splitlines(), key=len)
+    cookies = [{"name": k.strip(), "value": v.strip(), "domain": ".douyin.com", "path": "/"}
+               for k, v in (p.split("=", 1) for p in cookie_str.split(";") if "=" in p)]
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            ctx = b.new_context(user_agent=UA)
+            ctx.add_cookies(cookies)
+            pg = ctx.new_page()
+            pg.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=30000)
+            report("抖音可达（浏览器内核正常）", True)
+            # 结构探测：推荐流页面应内嵌作品数据（aweme 标记），改版后这些标记会消失
+            pg.goto("https://www.douyin.com/?recommend=1",
+                    wait_until="domcontentloaded", timeout=30000)
+            time.sleep(4)
+            html = pg.content()
+            struct = any(m in html for m in ('"aweme', "sec_uid", '"desc":'))
+            report("页面数据结构探测", struct,
+                   "" if struct else "页面里找不到作品数据标记，抖音可能已改版，爬虫功能大概率受影响")
+            b.close()
+    except Exception as e:
+        report("浏览器 / 网络", False, str(e)[:100])
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="抖音作品爬虫")
     parser.add_argument("--account", help="抖音号（个人主页显示的那个号）")
@@ -1056,7 +1133,11 @@ def main():
     parser.add_argument("--outdir", default=str(Path(__file__).parent / "downloads"),
                         help="输出目录（默认 脚本目录/downloads）")
     parser.add_argument("--headless", action="store_true", help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
+    parser.add_argument("--selftest", action="store_true",
+                        help="快速自检：依赖/cookies/网络/页面结构是否兼容（不跑任务）")
     args = parser.parse_args()
+    if args.selftest:
+        sys.exit(0 if _selftest() else 1)
 
     for date_arg in (args.since, args.until):
         if date_arg:

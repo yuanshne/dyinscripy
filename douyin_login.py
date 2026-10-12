@@ -44,8 +44,18 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
+_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+
+
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        _LOG_FILE.parent.mkdir(exist_ok=True)
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def cookies_ready(names):

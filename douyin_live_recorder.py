@@ -79,8 +79,19 @@ INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
                and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
 
 
+_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+
+
 def log(msg):
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    # 同时落盘到 logs/日期.log，事后可查（界面内存日志关掉就没了）
+    try:
+        _LOG_FILE.parent.mkdir(exist_ok=True)
+        with open(_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def pause(msg):
@@ -829,15 +840,24 @@ class LiveRecorder:
         log("⚠️ 无法确认 ffmpeg 屏幕坐标体系，按物理像素处理")
         return scale
 
-    # 档位叶子元素定位：返回可见的档位按钮/菜单项中心坐标（tier 为空查当前按钮）
+    # 档位叶子元素定位：返回可见的档位按钮/菜单项中心坐标（tier 为空查当前按钮）。
+    # 只认播放器区域内的同名元素，避免误点弹幕/评论里的相同文字。
     _TIER_RECT_JS = """
 (tier) => {
   const TS = ['原画','蓝光','超清','高清','标清'];
   const vis = e => e.offsetParent !== null || e.getClientRects().length;
+  const vid = document.querySelector('video');
+  const vr = vid ? vid.getBoundingClientRect() : null;
   const leaf = [...document.querySelectorAll('div,span')].filter(e => {
     const t = (e.textContent || '').trim();
-    return (tier ? t === tier : TS.includes(t)) && vis(e)
-      && ![...e.children].some(c => TS.includes((c.textContent || '').trim()));
+    if (!(tier ? t === tier : TS.includes(t)) || !vis(e)) return false;
+    if ([...e.children].some(c => TS.includes((c.textContent || '').trim()))) return false;
+    if (vr) {
+      const r = e.getBoundingClientRect();
+      const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+      if (cx < vr.x || cx > vr.x + vr.width || cy < vr.y || cy > vr.y + vr.height) return false;
+    }
+    return true;
   });
   if (!leaf.length) return null;
   const r = leaf[0].getBoundingClientRect();
@@ -864,6 +884,8 @@ class LiveRecorder:
                     time.sleep(0.3)
                     self._page.mouse.click(r["x"], r["y"])
                     time.sleep(2.0)
+                    # 鼠标移开，避免控制栏一直显示在录制画面里
+                    self._page.mouse.move(10, 10)
                     log(f"播放器清晰度已切到「{r['t']}」")
                     return
             self._page.mouse.move(10, 10)  # 没有更高档，移开鼠标收起菜单
@@ -914,6 +936,8 @@ class LiveRecorder:
                         self._poll_stop()
                         time.sleep(2)
                     self._reopen_room()
+                    # 重开页面后播放器回到默认标清，需重新切到最高档
+                    self._switch_player_quality()
                     continue
                 log("拿不到直播流地址（观看视角的声音需要从直播流提取）")
                 self._check_captcha()
@@ -1174,6 +1198,55 @@ def salvage_leftover_flv(outdir):
     log("=" * 60)
 
 
+def _selftest():
+    """快速自检：ffmpeg / 屏幕采集 / cookies / 网络是否可用（不录）。
+
+    「录不上」时先跑这个，快速定位是环境问题还是抖音页面问题。
+    """
+    ok = True
+
+    def report(name, good, detail=""):
+        nonlocal ok
+        ok = ok and good
+        log(f"{'✅' if good else '❌'} {name}{('：' + detail) if detail else ''}")
+
+    # 1. ffmpeg（转封装 / 观看视角录屏都靠它）
+    report("ffmpeg", has_ffmpeg(),
+           "" if has_ffmpeg() else "未找到（重跑「打开爬虫界面.bat」自动安装）")
+
+    # 2. 屏幕采集（观看视角模式依赖 gdigrab 抓屏）
+    probe = Path(os.environ.get("TEMP", ".")) / "_recorder_selftest.png"
+    try:
+        subprocess.run([ffmpeg_cmd(), "-y", "-loglevel", "error", "-f", "gdigrab",
+                        "-i", "desktop", "-frames", "1", str(probe)],
+                       capture_output=True, timeout=30)
+        good = probe.exists() and probe.stat().st_size > 10240
+        report("屏幕采集（gdigrab 抓帧）", good)
+    except Exception as e:
+        report("屏幕采集（gdigrab 抓帧）", False, str(e)[:80])
+    finally:
+        probe.unlink(missing_ok=True)
+
+    # 3. cookies
+    ck = Path(__file__).parent / "cookies.txt"
+    good = ck.exists() and ck.stat().st_size > 50
+    report("cookies 文件", good,
+           str(ck) if good else f"缺失（{ck}），未登录也能录大部分直播，但部分直播间受限")
+
+    # 4. 浏览器 + 直播站可达
+    try:
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            pg = b.new_context(user_agent=UA).new_page()
+            pg.goto("https://live.douyin.com/", wait_until="domcontentloaded",
+                    timeout=30000)
+            report("直播站可达（浏览器内核正常）", True)
+            b.close()
+    except Exception as e:
+        report("直播站可达（浏览器内核正常）", False, str(e)[:100])
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description="抖音直播录制器（纯净画面，无弹幕评论等 UI）")
     parser.add_argument("--url", help="直播间链接（live.douyin.com/数字 或 live.douyin.com/@昵称）")
@@ -1189,7 +1262,11 @@ def main():
                         help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
     parser.add_argument("--danmode", choices=["clean", "view"], default="clean",
                         help="录制视角：clean=纯净原始流(无弹幕) view=观看视角(画面含弹幕，录屏)")
+    parser.add_argument("--selftest", action="store_true",
+                        help="快速自检：ffmpeg/屏幕采集/cookies/网络是否可用（不录）")
     args = parser.parse_args()
+    if args.selftest:
+        sys.exit(0 if _selftest() else 1)
 
     # 崩溃兜底：先处理上次异常退出残留的录制文件（定时任务也不受影响）
     salvage_leftover_flv(args.outdir)

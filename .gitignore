@@ -7,6 +7,9 @@ cookies.txt.bak
 # 下载输出
 downloads/
 
+# 任务日志
+logs/
+
 # Python
 __pycache__/
 *.py[cod]
