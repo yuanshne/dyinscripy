@@ -174,6 +174,21 @@ def has_ffmpeg():
     return ffmpeg_cmd() is not None
 
 
+def wgc_available():
+    """Windows.Graphics.Capture 窗口采集是否可用（Win10 1903+）。
+
+    可用时观看视角用它按窗口句柄采集：窗口被其他窗口遮挡也能正常录制，
+    不再需要置顶占着前台；不可用时回退 gdigrab 抓屏 + 置顶的老方案。
+    """
+    if sys.platform != "win32" or ctypes is None:
+        return False
+    try:
+        import windows_capture  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def os_display_scale():
     """主屏的 Windows 显示缩放倍率（1.0 / 1.25 / 1.5 ...），失败返回 1.0。
 
@@ -812,6 +827,116 @@ class LiveRecorder:
             return None
         return (pt.x, pt.y)
 
+    def _visible_window_bounds(self, hwnd):
+        """窗口的可见边界（DWM 扩展帧边界，物理像素），失败退回 GetWindowRect。
+
+        WGC 按窗口采集出的帧边界与 DWM 可见边界一致，而 GetWindowRect
+        还包含左右约 7px 的不可见拖拽边框，算裁剪偏移必须用前者对齐。
+        """
+        user32 = ctypes.windll.user32
+        rect = ctypes.wintypes.RECT()
+        try:
+            hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
+                ctypes.c_void_p(hwnd), ctypes.c_uint(9),  # DWMWA_EXTENDED_FRAME_BOUNDS
+                ctypes.byref(rect), ctypes.sizeof(rect))
+        except Exception:
+            hr = -1
+        if hr != 0:
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+        return (rect.left, rect.top, rect.right, rect.bottom)
+
+    def _player_crop_rect(self):
+        """WGC 用：播放器区域相对窗口采集帧的裁剪矩形（物理像素）。
+
+        WGC 帧原点是窗口左上角，与窗口在屏幕上的位置无关，因此窗口
+        被移动甚至被遮挡都不影响裁剪；偏移 = 视口原点 - 窗口可见边界
+        左上角 + 播放器 CSS 偏移 × 显示缩放。宽高取偶避免 yuv420p 报错。
+        取不到播放器返回 None（WGC 模式不做整窗兜底，禁止标签栏入镜）。
+        """
+        info = None
+        deadline = time.time() + 8
+        while time.time() < deadline:
+            try:
+                info = self._page.evaluate(self._PLAYER_RECT_JS)
+            except Exception:
+                info = None
+            if info:
+                break
+            time.sleep(1)
+        if not info:
+            return None
+        hwnd = self._find_chrome_hwnd()
+        if hwnd is None:
+            return None
+        origin = self._viewport_origin(hwnd)
+        if origin is None:
+            return None
+        bounds = self._visible_window_bounds(hwnd)
+        if bounds is None:
+            return None
+        scale = os_display_scale()
+        cx = origin[0] - bounds[0] + round(info["left"] * scale)
+        cy = origin[1] - bounds[1] + round(info["top"] * scale)
+        w = round(info["width"] * scale) // 2 * 2
+        h = round(info["height"] * scale) // 2 * 2
+        if w < 320 or h < 240:
+            return None
+        return (cx, cy, w, h)
+
+    def _wgc_start(self, hwnd, crop, proc):
+        """启动 WGC 窗口采集，把帧裁剪后写入 ffmpeg stdin（rawvideo bgra）。
+
+        回调运行在采集线程，frame_buffer 是零拷贝视图，回调返回后即失效，
+        必须当场裁剪并写出。按 30fps 节流丢帧，保证 rawvideo 时间轴正确。
+        返回 (capture_control, state_dict)，state.closed=True 表示窗口已关闭。
+        """
+        import windows_capture as wc
+
+        state = {"closed": False, "frames": 0, "errors": 0, "clamped": False}
+        cx, cy, w, h = crop
+        box = [cx, cy, cx + w, cy + h]   # x0,y0,x1,y1，首帧时夹取到帧范围内
+        interval = 1.0 / 30
+        last = [0.0]
+
+        def on_frame(frame, capture_control):
+            if state["errors"] >= 5:
+                capture_control.stop()
+                return
+            if not state["clamped"]:
+                # 窗口部分出屏时 WGC 帧只含屏内部分，裁剪框越界会让切片
+                # 尺寸悄悄变小、与 ffmpeg 声明的 rawvideo 尺寸不符，先夹取
+                state["clamped"] = True
+                x0, y0 = max(0, box[0]), max(0, box[1])
+                x1 = min(frame.width, box[2])
+                y1 = min(frame.height, box[3])
+                if (x0, y0, x1, y1) != tuple(box):
+                    log(f"⚠️ 播放器区域超出窗口采集帧，已夹取，"
+                        f"可能录不完整（窗口部分在屏幕外？）")
+                box[0], box[1], box[2], box[3] = x0, y0, x1, y1
+            now = time.time()
+            if now - last[0] < interval - 0.002:
+                return
+            last[0] = now
+            try:
+                proc.stdin.write(
+                    frame.frame_buffer[box[1]:box[3], box[0]:box[2]].tobytes())
+                state["frames"] += 1
+            except Exception:
+                # ffmpeg 已退出（正常收尾关管道后属正常情况）
+                state["errors"] += 1
+
+        def on_closed():
+            state["closed"] = True
+
+        cap = wc.WindowsCapture(cursor_capture=False, draw_border=False,
+                                window_hwnd=hwnd)
+        cap.frame_handler = on_frame
+        cap.closed_handler = on_closed
+        ctrl = cap.start_free_threaded()
+        return ctrl, state
+
+
     def _set_browser_topmost(self, top):
         """把浏览器窗口置顶（top=True）或取消置顶（top=False）。
 
@@ -978,18 +1103,24 @@ class LiveRecorder:
     def _record_viewmode(self, room_id):
         """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
 
-        与纯净模式不同，页面必须保持打开且不被遮挡（录的就是这块屏幕区域），
-        因此资源占用更高、画质为播放分辨率而非原始流分辨率。
-        一个 ffmpeg 进程同时采集屏幕和直播流声音，直接输出 mp4。
+        优先用 WGC 按窗口句柄采集：窗口被遮挡也能录，无需置顶（但最小化
+        会让窗口停止渲染，录不到画面）。WGC 不可用时回退 gdigrab 抓屏 +
+        置顶。一个 ffmpeg 进程同时采集画面和直播流声音，直接输出 mp4。
         """
         if not has_ffmpeg():
-            log("❗观看视角录制需要 ffmpeg（用于屏幕采集），未检测到 ffmpeg")
+            log("❗观看视角录制需要 ffmpeg（用于画面采集），未检测到 ffmpeg")
             log("   重新运行「打开爬虫界面.bat」会自动装上，或改用「纯净原始流」模式")
             return
         vx, vy, vw, vh = VIEW_WIN
-        grab_scale = self._probe_grab_scale()
-        log(f"观看视角模式：只录播放器画面（含弹幕），声音来自原始直播流")
-        log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
+        use_wgc = wgc_available()
+        grab_scale = None   # gdigrab 坐标体系探测，回退路径首次用到时再测
+        if use_wgc:
+            log("画面采集：WGC 窗口采集（窗口可以被其他窗口遮挡，保持不最小化即可）")
+        else:
+            log("WGC 不可用（需 Win10 1903+，pip install windows-capture），"
+                "回退 gdigrab 抓屏")
+            log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
+        log("观看视角模式：只录播放器画面（含弹幕），声音来自原始直播流")
         # 网页播放器默认放标清，先切到最高档再录，避免录出来糊
         self._switch_player_quality()
         # 页面取消静音，和平时看直播一样（录制声音仍直接取自原始流，互不影响）
@@ -1029,14 +1160,30 @@ class LiveRecorder:
                 continue
 
             # 每段录制前重新定位播放器（页面重开/布局变化后位置会变）
-            region = self._player_capture_rect(grab_scale)
-            if region:
-                vx, vy, vw, vh = region
-                log(f"已定位播放器区域：({vx},{vy}) {vw}x{vh}（不含浏览器标签栏/地址栏）")
+            backend = "wgc" if use_wgc else "gdigrab"
+            hwnd = crop = None
+            if backend == "wgc":
+                hwnd = self._find_chrome_hwnd()
+                crop = self._player_crop_rect() if hwnd else None
+                if not crop:
+                    # WGC 模式不做整窗兜底：整窗会把标签栏/地址栏录进去
+                    log("⚠️ 未能定位播放器区域（WGC 仅录播放器区域，不整窗兜底）")
+                    fails += 1
+                    time.sleep(2)
+                    continue
+                _, _, vw, vh = crop
+                log(f"已定位播放器区域：{vw}x{vh}（窗口内裁剪，不含浏览器标签栏/地址栏）")
             else:
-                # VIEW_WIN 是窗口钉扎用的逻辑像素（DIP），同样要换算成 gdigrab 坐标
-                vx, vy, vw, vh = (int(v * grab_scale) // 2 * 2 for v in VIEW_WIN)
-                log(f"⚠️ 未能定位播放器，退回录制整窗区域 ({vx},{vy}) {vw}x{vh}")
+                if grab_scale is None:
+                    grab_scale = self._probe_grab_scale()
+                region = self._player_capture_rect(grab_scale)
+                if region:
+                    vx, vy, vw, vh = region
+                    log(f"已定位播放器区域：({vx},{vy}) {vw}x{vh}（不含浏览器标签栏/地址栏）")
+                else:
+                    # VIEW_WIN 是窗口钉扎用的逻辑像素（DIP），同样要换算成 gdigrab 坐标
+                    vx, vy, vw, vh = (int(v * grab_scale) // 2 * 2 for v in VIEW_WIN)
+                    log(f"⚠️ 未能定位播放器，退回录制整窗区域 ({vx},{vy}) {vw}x{vh}")
 
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             mp4 = self.outdir / f"{room_id}_{stamp}_part{part}_观看视角.mp4"
@@ -1046,29 +1193,48 @@ class LiveRecorder:
                 if self.duration:
                     log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
             log(f"✅ 开始观看视角录制 → {mp4.name}")
-            self._set_browser_topmost(True)   # 开录前置顶，防止被遮挡录到别的窗口
-            cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
-                   "-f", "gdigrab", "-framerate", "30",
-                   "-offset_x", str(vx), "-offset_y", str(vy),
-                   "-video_size", f"{vw}x{vh}", "-i", "desktop",
-                   "-user_agent", UA,
-                   "-headers", "Referer: https://live.douyin.com/\r\n",
-                   "-i", url,
-                   "-map", "0:v", "-map", "1:a",
-                   "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                   "-pix_fmt", "yuv420p",
-                   "-c:a", "aac", "-b:a", "160k",
-                   str(mp4)]
+            if backend == "wgc":
+                cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
+                       "-f", "rawvideo", "-pix_fmt", "bgra",
+                       "-video_size", f"{vw}x{vh}", "-framerate", "30",
+                       "-i", "-",
+                       "-user_agent", UA,
+                       "-headers", "Referer: https://live.douyin.com/\r\n",
+                       "-i", url,
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                       "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-b:a", "160k",
+                       str(mp4)]
+            else:
+                self._set_browser_topmost(True)   # 开录前置顶，防止被遮挡录到别的窗口
+                cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
+                       "-f", "gdigrab", "-framerate", "30",
+                       "-offset_x", str(vx), "-offset_y", str(vy),
+                       "-video_size", f"{vw}x{vh}", "-i", "desktop",
+                       "-user_agent", UA,
+                       "-headers", "Referer: https://live.douyin.com/\r\n",
+                       "-i", url,
+                       "-map", "0:v", "-map", "1:a",
+                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                       "-pix_fmt", "yuv420p",
+                       "-c:a", "aac", "-b:a", "160k",
+                       str(mp4)]
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
 
             def stop_ffmpeg():
-                # 必须发 q 让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）
+                # 必须让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）：
+                # gdigrab 的 stdin 空闲，写 q 触发收尾；WGC 的 stdin 是 rawvideo
+                # 视频流，写 q 会被当成帧数据，必须关管道以 EOF 收尾
                 if proc.poll() is None:
                     try:
-                        proc.stdin.write(b"q")
-                        proc.stdin.flush()
+                        if backend == "wgc":
+                            proc.stdin.close()
+                        else:
+                            proc.stdin.write(b"q")
+                            proc.stdin.flush()
                     except Exception:
                         pass
                     try:
@@ -1076,21 +1242,39 @@ class LiveRecorder:
                     except Exception:
                         proc.kill()
 
+            wgc_ctrl = None
+            wgc_state = None
             last_report = time.time()
             try:
+                if backend == "wgc":
+                    try:
+                        wgc_ctrl, wgc_state = self._wgc_start(hwnd, crop, proc)
+                    except Exception as e:
+                        # 本段作废（rawvideo 无数据），下段起回退 gdigrab+置顶
+                        log(f"⚠️ WGC 采集启动失败（{e}），本段作废，后续回退 gdigrab")
+                        use_wgc = False
                 while proc.poll() is None and not self._time_up():
                     time.sleep(3)
                     if mp4.exists() and time.time() - last_report >= 30:
                         log(f"  录制中... {mp4.stat().st_size / 1048576:.1f} MB")
                         last_report = time.time()
+                    if wgc_state and wgc_state["closed"]:
+                        log("浏览器窗口已关闭，停止录制")
+                        break
                     if self._live_ended():
                         log("页面显示直播已结束，停止录制")
                         break
                     self._check_captcha()
                     self._poll_stop()
             finally:
+                if wgc_ctrl is not None:
+                    try:
+                        wgc_ctrl.stop()   # 先停采集，管道不再进帧
+                    except Exception:
+                        pass
                 stop_ffmpeg()   # 无论正常结束还是中断，都让 ffmpeg 写完 mp4 索引
-                self._set_browser_topmost(False)   # 录完恢复普通窗口层级
+                if backend == "gdigrab":
+                    self._set_browser_topmost(False)   # 录完恢复普通窗口层级
 
             size = mp4.stat().st_size if mp4.exists() else 0
             if size >= 102400:
@@ -1313,6 +1497,26 @@ def _selftest():
         report("屏幕采集（gdigrab 抓帧）", False, str(e)[:80])
     finally:
         probe.unlink(missing_ok=True)
+
+    # 2b. WGC 窗口采集（观看视角优选：窗口可被遮挡、无需置顶）
+    if wgc_available():
+        good = False
+        detail = ""
+        try:
+            import windows_capture as wc
+            # 用桌面窗口做一次真实构造，验证本机 WGC 运行时确实可用
+            wc.WindowsCapture(cursor_capture=False, draw_border=False,
+                              window_hwnd=ctypes.windll.user32.GetShellWindow())
+            good = True
+        except Exception as e:
+            detail = str(e)[:80]
+        report("WGC 窗口采集（windows-capture）", good,
+               "可用，观看视角录制无需置顶" if good
+               else f"WGC 运行时不可用（{detail}），观看视角将回退 gdigrab+置顶")
+    else:
+        report("WGC 窗口采集（windows-capture）", False,
+               "未安装 windows-capture 或系统过旧（需 Win10 1903+），"
+               "观看视角将回退 gdigrab+置顶")
 
     # 3. cookies
     ck = Path(__file__).parent / "cookies.txt"
