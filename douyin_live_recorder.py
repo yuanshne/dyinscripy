@@ -812,6 +812,29 @@ class LiveRecorder:
             return None
         return (pt.x, pt.y)
 
+    def _set_browser_topmost(self, top):
+        """把浏览器窗口置顶（top=True）或取消置顶（top=False）。
+
+        gdigrab 抓的是屏幕上该区域的实际像素，任何窗口盖住浏览器都会被
+        录进去，因此每段开录前必须置顶；录完恢复普通层级，不干扰日常使用。
+        """
+        if ctypes is None:
+            return
+        try:
+            hwnd = self._find_chrome_hwnd()
+            if not hwnd:
+                log("⚠️ 未找到浏览器窗口句柄，无法置顶，请勿遮挡弹出的窗口")
+                return
+            user32 = ctypes.windll.user32
+            if top:
+                user32.SetForegroundWindow(hwnd)
+            user32.SetWindowPos(hwnd, -1 if top else -2, 0, 0, 0, 0,
+                                0x0001 | 0x0002 | 0x0040)  # SWP_NOSIZE|NOMOVE|SHOWWINDOW
+            if top:
+                log("浏览器窗口已置顶，录制期间请勿在该窗口内做任何操作")
+        except Exception:
+            pass
+
     def _player_capture_rect(self, grab_scale):
         """算出播放器（画面+弹幕层，两者重合）在屏幕上的 gdigrab 采集区域。
 
@@ -912,8 +935,22 @@ class LiveRecorder:
         必须用真实鼠标事件：悬停档位按钮等菜单出现，再点最高档。
         """
         try:
-            cur = self._page.evaluate(self._TIER_RECT_JS, None)
+            # 控制栏默认隐藏，档位按钮不可见时先悬停播放器中央唤出控制栏再找，
+            # 带重试；页面刚加载时控件可能尚未渲染
+            cur = None
+            deadline = time.time() + 6
+            while time.time() < deadline and not cur:
+                cur = self._page.evaluate(self._TIER_RECT_JS, None)
+                if not cur:
+                    vr = self._page.evaluate(
+                        "() => { const v = document.querySelector('video');"
+                        " if (!v) return null; const r = v.getBoundingClientRect();"
+                        " return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }")
+                    if vr:
+                        self._page.mouse.move(vr["x"], vr["y"])
+                    time.sleep(1.0)
             if not cur:
+                log("⚠️ 未找到播放器清晰度控件，保持默认画质录制")
                 return
             self._page.mouse.move(cur["x"], cur["y"])
             time.sleep(0.8)
@@ -1009,6 +1046,7 @@ class LiveRecorder:
                 if self.duration:
                     log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
             log(f"✅ 开始观看视角录制 → {mp4.name}")
+            self._set_browser_topmost(True)   # 开录前置顶，防止被遮挡录到别的窗口
             cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
                    "-f", "gdigrab", "-framerate", "30",
                    "-offset_x", str(vx), "-offset_y", str(vy),
@@ -1052,6 +1090,7 @@ class LiveRecorder:
                     self._poll_stop()
             finally:
                 stop_ffmpeg()   # 无论正常结束还是中断，都让 ffmpeg 写完 mp4 索引
+                self._set_browser_topmost(False)   # 录完恢复普通窗口层级
 
             size = mp4.stat().st_size if mp4.exists() else 0
             if size >= 102400:
