@@ -39,10 +39,12 @@
 
 import argparse
 import os
+import random
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1100,6 +1102,55 @@ class LiveRecorder:
         except Exception:
             pass
 
+    def _audio_relay_start(self, url):
+        """把直播流音频转成 mpegts 打到本地 UDP 回环，供主 ffmpeg 作音源。
+
+        直播 flv 连接偶发被服务端重置，若把流地址直接交给主 ffmpeg，断流
+        在 -shortest 下会整段截断。中转进程断流后自动重启续流（重启间隙
+        静音），墙钟时间戳保证跨重启时间轴连续，主画面录制不受影响。
+        返回控制句柄：置 relay["stop"]=True 结束；relay["pulled"] 表示已
+        拉到流；relay["dead"] 表示重试耗尽（之后录制继续但无声）。
+        """
+        port = random.randint(20000, 40000)
+        state = {"port": port, "stop": False, "pulled": False,
+                 "dead": False, "proc": None}
+        dst = f"udp://127.0.0.1:{port}?pkt_size=1316"
+
+        def loop():
+            fails = 0
+            while not state["stop"] and fails < 10:
+                try:
+                    p = subprocess.Popen(
+                        [ffmpeg_cmd(), "-loglevel", "error",
+                         "-use_wallclock_as_timestamps", "1",
+                         "-user_agent", UA,
+                         "-headers", "Referer: https://live.douyin.com/\r\n",
+                         "-i", url, "-vn", "-c:a", "copy",
+                         "-f", "mpegts", dst],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except Exception:
+                    fails += 1
+                    time.sleep(2)
+                    continue
+                state["proc"] = p
+                time.sleep(1.5)   # 短暂存活即认为拉到流（坏地址秒退）
+                if p.poll() is None:
+                    state["pulled"] = True
+                while p.poll() is None and not state["stop"]:
+                    time.sleep(0.5)
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                if state["stop"]:
+                    break
+                fails += 1
+                time.sleep(1)   # 断流重启间隙
+            state["dead"] = fails >= 10
+
+        threading.Thread(target=loop, daemon=True).start()
+        return state
+
     def _record_viewmode(self, room_id):
         """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
 
@@ -1193,14 +1244,28 @@ class LiveRecorder:
                 if self.duration:
                     log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
             log(f"✅ 开始观看视角录制 → {mp4.name}")
+            relay = None
             if backend == "wgc":
+                # 音频经独立中转进程拉流转 mpegts，走本地 UDP 回环喂给主
+                # ffmpeg：直播 flv 连接偶发被服务端重置，直接交给主 ffmpeg
+                # 的话断流即截断；UDP 输入永不 EOF，断流由中转线程自动
+                # 重启续流，主画面照常录满设定时长
+                relay = self._audio_relay_start(url)
+                while (not relay["pulled"] and not relay["stop"]
+                       and not relay["dead"]):
+                    time.sleep(0.1)   # 主 ffmpeg 的 UDP 输入要等首包才开流
+                if relay["dead"] and not relay["pulled"]:
+                    log("⚠️ 音频源多次重试失败，本段不开录，稍后重试")
+                    relay["stop"] = True
+                    fails += 1
+                    continue
                 cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
                        "-f", "rawvideo", "-pix_fmt", "bgra",
                        "-video_size", f"{vw}x{vh}", "-framerate", "30",
                        "-i", "-",
-                       "-user_agent", UA,
-                       "-headers", "Referer: https://live.douyin.com/\r\n",
-                       "-i", url,
+                       "-f", "mpegts",
+                       "-i", (f"udp://127.0.0.1:{relay['port']}"
+                              "?listen=1&overrun_nonfatal=1&fifo_size=500000"),
                        "-map", "0:v", "-map", "1:a", "-shortest",
                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                        "-pix_fmt", "yuv420p",
@@ -1227,9 +1292,9 @@ class LiveRecorder:
             def stop_ffmpeg():
                 # 必须让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）：
                 # gdigrab 的 stdin 空闲，写 q 触发收尾；WGC 的 stdin 是 rawvideo
-                # 视频流，写 q 会被当成帧数据，必须关管道以 EOF 收尾——配合
-                # -shortest，视频 EOF 后 ffmpeg 会对着无限的直播音频流立即
-                # 正常收尾退出，否则它会一直挂在音频上等超时被强杀、丢 moov
+                # 视频流，写 q 会被当成帧数据，必须关管道以视频 EOF 收尾——
+                # 音频走本地 UDP 永不 EOF，配合 -shortest 视频 EOF 即正常
+                # 收尾退出，否则 ffmpeg 挂在无终止的音频输入上被强杀丢 moov
                 if proc.poll() is None:
                     try:
                         if backend == "wgc":
@@ -1269,6 +1334,12 @@ class LiveRecorder:
                     self._check_captcha()
                     self._poll_stop()
             finally:
+                if relay is not None:
+                    relay["stop"] = True   # 先停音频中转，管道不再进数据
+                    try:
+                        relay["proc"].kill()
+                    except Exception:
+                        pass
                 if wgc_ctrl is not None:
                     try:
                         wgc_ctrl.stop()   # 先停采集，管道不再进帧
