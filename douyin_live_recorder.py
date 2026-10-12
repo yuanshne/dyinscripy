@@ -829,6 +829,47 @@ class LiveRecorder:
         log("⚠️ 无法确认 ffmpeg 屏幕坐标体系，按物理像素处理")
         return scale
 
+    # 档位叶子元素定位：返回可见的档位按钮/菜单项中心坐标（tier 为空查当前按钮）
+    _TIER_RECT_JS = """
+(tier) => {
+  const TS = ['原画','蓝光','超清','高清','标清'];
+  const vis = e => e.offsetParent !== null || e.getClientRects().length;
+  const leaf = [...document.querySelectorAll('div,span')].filter(e => {
+    const t = (e.textContent || '').trim();
+    return (tier ? t === tier : TS.includes(t)) && vis(e)
+      && ![...e.children].some(c => TS.includes((c.textContent || '').trim()));
+  });
+  if (!leaf.length) return null;
+  const r = leaf[0].getBoundingClientRect();
+  return {t: leaf[0].textContent.trim(), x: r.x + r.width / 2, y: r.y + r.height / 2};
+}
+"""
+
+    def _switch_player_quality(self):
+        """把网页播放器切到最高档（原画→蓝光→超清），尽力而为，失败不影响录制。
+
+        播放器默认放标清且清晰度菜单靠悬停展开，JS click() 触发不了，
+        必须用真实鼠标事件：悬停档位按钮等菜单出现，再点最高档。
+        """
+        try:
+            cur = self._page.evaluate(self._TIER_RECT_JS, None)
+            if not cur:
+                return
+            self._page.mouse.move(cur["x"], cur["y"])
+            time.sleep(0.8)
+            for tier in ("原画", "蓝光", "超清"):
+                r = self._page.evaluate(self._TIER_RECT_JS, tier)
+                if r:
+                    self._page.mouse.move(r["x"], r["y"])
+                    time.sleep(0.3)
+                    self._page.mouse.click(r["x"], r["y"])
+                    time.sleep(2.0)
+                    log(f"播放器清晰度已切到「{r['t']}」")
+                    return
+            self._page.mouse.move(10, 10)  # 没有更高档，移开鼠标收起菜单
+        except Exception:
+            pass
+
     def _record_viewmode(self, room_id):
         """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
 
@@ -844,6 +885,8 @@ class LiveRecorder:
         grab_scale = self._probe_grab_scale()
         log(f"观看视角模式：只录播放器画面（含弹幕），声音来自原始直播流")
         log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
+        # 网页播放器默认放标清，先切到最高档再录，避免录出来糊
+        self._switch_player_quality()
         # 页面取消静音，和平时看直播一样（录制声音仍直接取自原始流，互不影响）
         try:
             self._page.evaluate(
