@@ -334,7 +334,7 @@ class LiveRecorder:
     def _is_direct_room(query):
         """输入是否直接指向直播间：直播间链接或纯数字房间号"""
         q = query.strip()
-        return bool(re.search(r"live\.douyin\.com/\d+", q)
+        return bool(re.search(r"live\.douyin\.com/(?:\d+|live_web_rid=\d+)", q)
                     or re.fullmatch(r"\d{5,}", q))
 
     @staticmethod
@@ -446,7 +446,9 @@ class LiveRecorder:
     def open_room(self, query):
         """打开直播间页面，返回房间号（拿不到就返回 'live'）"""
         query = query.strip()
-        m = re.search(r"live\.douyin\.com/(\d+)", query)
+        # live.douyin.com/数字 或 live_web_rid=数字 都归一化成标准数字地址
+        m = (re.search(r"live\.douyin\.com/(\d+)", query)
+             or re.search(r"live_web_rid=(\d+)", query))
         if m:
             url = f"https://live.douyin.com/{m.group(1)}"
         elif re.fullmatch(r"\d{5,}", query):

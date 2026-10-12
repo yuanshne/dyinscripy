@@ -54,7 +54,8 @@ def task_cmd(kind):
     """
     if FROZEN:
         return [sys.executable, "--task", kind]
-    return [sys.executable, str(BASE_DIR / f"douyin_{kind}.py")]
+    name = "douyin_live_recorder.py" if kind == "recorder" else f"douyin_{kind}.py"
+    return [sys.executable, str(BASE_DIR / name)]
 
 
 def _ensure_runtime_chromium():
