@@ -1201,7 +1201,7 @@ class LiveRecorder:
                        "-user_agent", UA,
                        "-headers", "Referer: https://live.douyin.com/\r\n",
                        "-i", url,
-                       "-map", "0:v", "-map", "1:a",
+                       "-map", "0:v", "-map", "1:a", "-shortest",
                        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                        "-pix_fmt", "yuv420p",
                        "-c:a", "aac", "-b:a", "160k",
@@ -1227,7 +1227,9 @@ class LiveRecorder:
             def stop_ffmpeg():
                 # 必须让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）：
                 # gdigrab 的 stdin 空闲，写 q 触发收尾；WGC 的 stdin 是 rawvideo
-                # 视频流，写 q 会被当成帧数据，必须关管道以 EOF 收尾
+                # 视频流，写 q 会被当成帧数据，必须关管道以 EOF 收尾——配合
+                # -shortest，视频 EOF 后 ffmpeg 会对着无限的直播音频流立即
+                # 正常收尾退出，否则它会一直挂在音频上等超时被强杀、丢 moov
                 if proc.poll() is None:
                     try:
                         if backend == "wgc":
