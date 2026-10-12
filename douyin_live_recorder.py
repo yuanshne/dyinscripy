@@ -328,6 +328,30 @@ class LiveRecorder:
 
         return sorted(out, key=rank)
 
+    # 播放器 store 里的分档拉流地址：FULL_HD1=原画，播放器画面默认放的是标清
+    _STORE_FLV_JS = """
+() => {
+  try {
+    const info = window.__STORE__ && window.__STORE__.roomStore
+      && window.__STORE__.roomStore.roomInfo;
+    const urls = (info && info.room && info.room.stream_url
+                  && info.room.stream_url.flv_pull_url)
+                 || (info && info.web_stream_url && info.web_stream_url.flv_pull_url)
+                 || null;
+    if (!urls) return null;
+    return urls.FULL_HD1 || urls.HD1 || urls.SD1 || urls.SD2 || null;
+  } catch (e) { return null; }
+}
+"""
+
+    def _stream_from_store(self):
+        """从播放器数据直取最高档（原画）flv 地址，拿不到返回 None"""
+        try:
+            u = self._page.evaluate(self._STORE_FLV_JS)
+        except Exception:
+            return None
+        return u if (u and ".flv?" in u) else None
+
     # ---------- 直播间 ----------
 
     @staticmethod
@@ -978,7 +1002,14 @@ class LiveRecorder:
             while fails < 3 and not self._time_up():
                 self._check_captcha()
                 log(f"寻找直播流...（第 {part} 段）")
-                kind, url = self.wait_for_stream(20)
+                # 优先直取播放器数据里的最高档（原画）；播放器默认放标清，
+                # 直接拦截播放器请求会录到低档画面
+                su = self._stream_from_store()
+                if su:
+                    kind, url = "flv", su
+                    log("已从播放器数据直取最高画质（原画）拉流地址")
+                else:
+                    kind, url = self.wait_for_stream(20)
 
                 if not url:
                     # 播放器走 WebRTC 时拦不到 flv 请求，改从页面数据里挖
