@@ -7,13 +7,16 @@
 # （见 build_portable.bat）
 
 import os
-from PyInstaller.utils.hooks import collect_data_files
+from PyInstaller.utils.hooks import collect_data_files, collect_all
+
+# windows-capture（WGC 窗口采集，观看视角录制）：连带 numpy/opencv 一起收集
+wc_datas, wc_binaries, wc_hidden = collect_all("windows_capture")
 
 a = Analysis(
     ["douyin_ui.py"],
     pathex=[],
-    binaries=[],
-    datas=[],
+    binaries=wc_binaries,
+    datas=wc_datas,
     # 三个子脚本由 exe 以 --task 参数二次启动时动态 import，需显式声明
     hiddenimports=[
         "douyin_spider",
@@ -21,10 +24,11 @@ a = Analysis(
         "douyin_login",
         "imageio_ffmpeg",
         "ctypes.wintypes",
+        *wc_hidden,
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "numpy", "pandas", "PIL"],
+    excludes=["tkinter", "matplotlib", "pandas", "PIL"],
     noarchive=False,
 )
 
