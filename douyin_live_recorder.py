@@ -217,6 +217,20 @@ def flv_to_mp4(flv_path):
     return None
 
 
+def check_disk_free(outdir, min_gb=5.0):
+    """开录前检查磁盘剩余空间，不足则拒绝开录（原画直播约 1~2GB/小时）"""
+    try:
+        free = shutil.disk_usage(outdir).free
+    except OSError as e:
+        log(f"磁盘空间检查失败（{e}），跳过检查继续执行")
+        return True
+    if free < min_gb * 1024 ** 3:
+        log(f"磁盘剩余空间不足 {min_gb:.0f}GB（仅剩 {free / 1024 ** 3:.1f}GB），"
+            "拒绝开录以免写到一半写坏文件；请清理磁盘后重试")
+        return False
+    return True
+
+
 # 清晰度选择：flv_pull_url 里的档位键（FULL_HD1=原画 HD1=超清 SD1=高清 SD2=标清），
 # 首选档缺失时按列表顺序就近回落
 QUALITY_KEYS = {
@@ -256,16 +270,26 @@ class LiveRecorder:
         log("启动浏览器...")
         self._pw = sync_playwright().start()
         args = ["--disable-blink-features=AutomationControlled"]
+        vp = {"width": 1600, "height": 900}
         if self.danmode == "view":
-            # 观看视角：窗口钉在固定位置，gdigrab 按同一区域采集画面
+            # 观看视角：窗口钉在固定位置，gdigrab 按同一区域采集画面；
+            # 小屏幕（如 1366x768）放不下固定窗口时收缩窗口与视口，避免弹幕被切掉
+            w, h = VIEW_WIN[2], VIEW_WIN[3]
+            if ctypes is not None:
+                scale = os_display_scale()   # 顺便把进程设为 DPI 感知
+                scr_w = ctypes.windll.user32.GetSystemMetrics(0) / scale
+                scr_h = ctypes.windll.user32.GetSystemMetrics(1) / scale
+                w = min(w, int(scr_w) - VIEW_WIN[0] - 10)
+                h = min(h, int(scr_h) - VIEW_WIN[1] - 10)
+                if (w, h) != (VIEW_WIN[2], VIEW_WIN[3]):
+                    log(f"屏幕偏小，观看视角窗口收缩为 {w}x{h}")
             args += [f"--window-position={VIEW_WIN[0]},{VIEW_WIN[1]}",
-                     f"--window-size={VIEW_WIN[2]},{VIEW_WIN[3]}"]
+                     f"--window-size={w},{h}"]
+            vp = {"width": max(960, w - 20), "height": max(540, h - 120)}
         self._browser = self._pw.chromium.launch(
             headless=self.headless,
             args=args,
         )
-        vp = ({"width": 1280, "height": 700} if self.danmode == "view"
-              else {"width": 1600, "height": 900})
         self._context = self._browser.new_context(
             user_agent=UA,
             viewport=vp,
@@ -1071,6 +1095,8 @@ class LiveRecorder:
         if self.start_ts:
             log("进入定时等待" + ("，不想等就 Ctrl+C 退出" if INTERACTIVE else ""))
             self.wait_for_start()
+        if not check_disk_free(self.outdir):
+            return
         # duration 从真正拿到流、开始录制那一刻才起算（启动浏览器/等开播不占时长）
         self.t_start = None
 
