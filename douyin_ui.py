@@ -737,7 +737,7 @@ PAGE = """<!DOCTYPE html>
         <option value="clean">纯净原始流（无弹幕，原画质）</option>
         <option value="view">观看视角（画面含弹幕，录屏+原声）</option>
       </select>
-      <div class="hint" style="margin-top:4px">观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口；画质为播放分辨率，ffmpeg 首次运行时自动安装。</div>
+      <div class="hint" style="margin-top:4px">观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口，也不要在该窗口里做任何操作（点击、滚动、切换标签页都会被录进去并导致画面晃动/丢失）；画质为播放分辨率，ffmpeg 首次运行时自动安装。</div>
       <label style="margin-top:10px">定时开始（如 20:00 或 2026-10-11 20:00，留空 = 立即开始）</label>
       <input type="text" id="startat" placeholder="主播没开播会自动等待，开播即录">
     </div>
