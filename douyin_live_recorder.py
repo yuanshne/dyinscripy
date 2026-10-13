@@ -1076,7 +1076,10 @@ class LiveRecorder:
                     raise
                 except Exception as e:
                     log(f"流中断: {type(e).__name__}: {e}")
-                    size = 0
+                    # 断流前已写入的数据仍是有效录像（tmp 在 record_flv 的
+                    # finally 里已改名为 .flv），按实际大小统计，
+                    # 否则会被误判成"没有录到有效数据"
+                    size = raw.stat().st_size if raw.exists() else 0
 
                 if size >= 102400:
                     log(f"  本段录制 {size/1048576:.1f} MB")
