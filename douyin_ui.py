@@ -154,8 +154,7 @@ class Runner:
             }
 
     def start(self, mode, query, cookie_text, limit, since=None, until=None,
-              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None,
-              quality=None):
+              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None):
         with self.lock:
             if self.running:
                 return "已有任务在运行，请先停止或等待完成"
@@ -232,16 +231,11 @@ class Runner:
         if mode == "live":
             cmd = task_cmd("recorder") + ["--cookie-file", str(cookie_path)] + outdir_arg
             cmd += ["--room" if re.fullmatch(r"\d{5,}", query) else "--url", query]
-            # 录制视角：clean=纯净原始流（默认） / view=观看视角（画面含弹幕）
-            if danmode == "view":
-                cmd += ["--danmode", "view"]
+            # 录制视角：clean=纯净原始流（默认） / clean_dm=纯净流+弹幕TXT
+            if danmode == "clean_dm":
+                cmd += ["--danmode", "clean_dm"]
             elif danmode not in (None, "", "clean"):
                 return "录制视角参数不合法"
-            # 录制画质：origin=原画（默认） super=超清 high=高清 standard=标清
-            if quality not in (None, "", "origin"):
-                if quality not in ("super", "high", "standard"):
-                    return "画质参数不合法"
-                cmd += ["--quality", quality]
             if (start_at or "").strip():
                 sa = start_at.strip()
                 if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?|\d{4}-\d{2}-\d{2} (?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?", sa):
@@ -741,16 +735,9 @@ PAGE = """<!DOCTYPE html>
       <label>录制视角</label>
       <select id="danmode">
         <option value="clean">纯净原始流（无弹幕，原画质）</option>
-        <option value="view">观看视角（画面含弹幕，录屏+原声）</option>
+        <option value="clean_dm">纯净流+弹幕（原始流 + 接口采集的弹幕 TXT）</option>
       </select>
-      <label style="margin-top:10px">录制画质（两种视角都生效）</label>
-      <select id="quality">
-        <option value="origin">原画（推荐）</option>
-        <option value="super">超清</option>
-        <option value="high">高清</option>
-        <option value="standard">标清</option>
-      </select>
-      <div class="hint" style="margin-top:4px">直播间没有所选档位时自动就近回落。观看视角：录下浏览器窗口里看到的画面（含弹幕/礼物特效），声音取自原始流；录制期间请勿移动、最小化或遮挡弹出的浏览器窗口，也不要在该窗口里做任何操作（点击、滚动、切换标签页都会被录进去并导致画面晃动/丢失）；画质为播放分辨率，ffmpeg 首次运行时自动安装。</div>
+      <div class="hint" style="margin-top:4px">纯净流+弹幕：录制无弹幕的原始流（自动选最高画质档），同时旁听直播间弹幕接口，收尾时生成与视频同名的 .txt 弹幕记录（列：相对时间秒、绝对时间、昵称、内容），录制期间会保持一个已暂停播放的浏览器页面用于维持弹幕连接。</div>
       <label style="margin-top:10px">定时开始（如 20:00 或 2026-10-11 20:00，留空 = 立即开始）</label>
       <input type="text" id="startat" placeholder="主播没开播会自动等待，开播即录">
     </div>
@@ -883,8 +870,7 @@ async function start() {
     batchType: $("batchType").value,
     outdir: $("outdir").value,
     sort: searchSort,
-    danmode: $("danmode") ? $("danmode").value : "clean",
-    quality: $("quality") ? $("quality").value : "origin"
+    danmode: $("danmode") ? $("danmode").value : "clean"
   });
   if (res.error) { setStatus(res.error, "err"); }
   else { $("logbox").textContent = ""; cursor = 0; poll(); }
@@ -1026,8 +1012,7 @@ class Handler(BaseHTTPRequestHandler):
                                data.get("since"), data.get("until"),
                                data.get("startat"),
                                data.get("batchType"), data.get("outdir"),
-                               data.get("sort"), data.get("danmode"),
-                               data.get("quality"))
+                               data.get("sort"), data.get("danmode"))
             self._send(200, json.dumps({"error": err}, ensure_ascii=False))
         elif self.path == "/login":
             err = runner.start("login", None, None, None)

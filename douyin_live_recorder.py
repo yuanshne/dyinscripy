@@ -38,6 +38,8 @@
 """
 
 import argparse
+import base64
+import gzip
 import os
 import random
 import re
@@ -51,12 +53,6 @@ from pathlib import Path
 from urllib.parse import quote
 
 try:
-    import ctypes
-    import ctypes.wintypes
-except ImportError:
-    ctypes = None  # 非 Windows 环境用不到 gdigrab，这里只做兜底
-
-try:
     import requests
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -68,10 +64,6 @@ except ImportError:
 # 与浏览器保持一致的 UA（拉流时也用同一个，降低风控概率）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-# 观看视角模式：浏览器窗口钉在这个位置/大小（逻辑像素），gdigrab 只采集
-# 其中播放器的真实区域（运行时动态定位，含弹幕层）
-VIEW_WIN = (30, 30, 1300, 820)
 
 # 「停止」标记文件：网页界面点「停止」时放置，录制器轮询到后优雅收尾退出
 _STOP_FLAG = Path(__file__).parent / "stop.flag"
@@ -176,39 +168,6 @@ def has_ffmpeg():
     return ffmpeg_cmd() is not None
 
 
-def wgc_available():
-    """Windows.Graphics.Capture 窗口采集是否可用（Win10 1903+）。
-
-    可用时观看视角用它按窗口句柄采集：窗口被其他窗口遮挡也能正常录制，
-    不再需要置顶占着前台；不可用时回退 gdigrab 抓屏 + 置顶的老方案。
-    """
-    if sys.platform != "win32" or ctypes is None:
-        return False
-    try:
-        import windows_capture  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def os_display_scale():
-    """主屏的 Windows 显示缩放倍率（1.0 / 1.25 / 1.5 ...），失败返回 1.0。
-
-    浏览器窗口坐标（JS 里的 screenX 等）是逻辑像素（DIP），
-    而 gdigrab 在 DPI 感知模式下按物理像素采集，两者相差这个倍率。
-    """
-    if ctypes is None:
-        return 1.0
-    try:
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except Exception:
-            ctypes.windll.user32.SetProcessDPIAware()
-        return ctypes.windll.user32.GetDpiForSystem() / 96.0
-    except Exception:
-        return 1.0
-
-
 def flv_to_mp4(flv_path):
     """用 ffmpeg 无损转封装 flv -> mp4，成功则删掉 flv，返回 mp4 路径"""
     if not has_ffmpeg():
@@ -248,26 +207,118 @@ def check_disk_free(outdir, min_gb=5.0):
     return True
 
 
-# 清晰度选择：flv_pull_url 里的档位键（FULL_HD1=原画 HD1=超清 SD1=高清 SD2=标清），
-# 首选档缺失时按列表顺序就近回落
-QUALITY_KEYS = {
-    "origin":   ["FULL_HD1", "HD1", "SD1", "SD2"],
-    "super":    ["HD1", "FULL_HD1", "SD1", "SD2"],
-    "high":     ["SD1", "HD1", "FULL_HD1", "SD2"],
-    "standard": ["SD2", "SD1", "HD1", "FULL_HD1"],
-}
+# 拉流档位键（FULL_HD1=原画 HD1=超清 SD1=高清 SD2=标清），
+# 首选原画，缺失时按列表顺序就近回落
+QUALITY_KEYS = ["FULL_HD1", "HD1", "SD1", "SD2"]
+
+
+# ---------- 弹幕接口 protobuf 最小解析（clean_dm 模式） ----------
+# 不引入完整 proto 定义，只按字段号取需要的值，遇到不认识的结构自然跳过。
+# 结构参照抖音 webcast 公开 proto：PushFrame{payloadType=7,payload=8}
+# -> gzip -> Response{messagesList=1} -> Message{method=1,payload=2}
+# -> ChatMessage{common=1,user=2,content=3}；Common.createTime=4，User.nickName=3
+
+def _pb_varint(buf, i):
+    r = s = 0
+    while True:
+        b = buf[i]
+        i += 1
+        r |= (b & 0x7F) << s
+        if not b & 0x80:
+            return r, i
+        s += 7
+        if s > 63:
+            raise ValueError("varint too long")
+
+
+def _pb_fields(buf):
+    """遍历 protobuf 字段，yield (字段号, wire_type, 值)；varint 为 int，其余为 bytes。"""
+    i, n = 0, len(buf)
+    while i < n:
+        key, i = _pb_varint(buf, i)
+        fno, wt = key >> 3, key & 7
+        if wt == 0:
+            v, i = _pb_varint(buf, i)
+        elif wt == 2:
+            ln, i = _pb_varint(buf, i)
+            if i + ln > n:
+                raise ValueError("length overflow")
+            v = buf[i:i + ln]
+            i += ln
+        elif wt == 5:
+            v, i = buf[i:i + 4], i + 4
+        elif wt == 1:
+            v, i = buf[i:i + 8], i + 8
+        else:
+            raise ValueError(f"wire type {wt}")
+        yield fno, wt, v
+
+
+def _pb_get(buf, fno):
+    """取第一个指定字段的值，取不到返回 None。"""
+    if not buf:
+        return None
+    for f, _wt, v in _pb_fields(buf):
+        if f == fno:
+            return v
+    return None
+
+
+def _pb_extract_messages(frame):
+    """弹幕推送帧 -> [(method, (服务端时刻, 昵称, 内容)), ...]，只取聊天消息。
+
+    解析器保证不抛异常：坏帧/未知结构返回空列表，由调用方放心使用。
+    """
+    try:
+        return _pb_extract_messages_inner(frame)
+    except Exception:
+        return []
+
+
+def _pb_extract_messages_inner(frame):
+    payload = _pb_get(frame, 8)          # PushFrame.payload
+    if payload is None:
+        payload = _pb_get(frame, 7)      # 兼容 payloadType=7/payload=8 的旧排布
+    if not payload:
+        return []
+    ptype = _pb_get(frame, 7)
+    if isinstance(ptype, bytes) and ptype not in (b"msg", b""):
+        return []                        # 只处理 msg 类型推送
+    try:
+        payload = gzip.decompress(payload)
+    except Exception:
+        pass                             # 未压缩的帧直接解
+    out = []
+    for f, wt, v in _pb_fields(payload):
+        if f != 1 or wt != 2:            # Response.messagesList
+            continue
+        method = _pb_get(v, 1)           # Message.method
+        if method != b"WebcastChatMessage":
+            continue
+        mpayload = _pb_get(v, 2)         # Message.payload (ChatMessage)
+        if not mpayload:
+            continue
+        common = _pb_get(mpayload, 1) or b""
+        user = _pb_get(mpayload, 2) or b""
+        content = _pb_get(mpayload, 3) or b""
+        create_ts = _pb_get(common, 4)   # Common.createTime（秒级时间戳）
+        nick = _pb_get(user, 3)          # User.nickName
+        out.append(("WebcastChatMessage",
+                    (int(create_ts or 0),
+                     nick.decode("utf-8", "ignore") if isinstance(nick, bytes) else "",
+                     content.decode("utf-8", "ignore") if isinstance(content, bytes) else "")))
+    return out
 
 
 class LiveRecorder:
     def __init__(self, cookies, outdir, duration=0, headless=False, start_ts=None,
-                 danmode="clean", quality="origin"):
+                 danmode="clean"):
         self.cookies = cookies
         self.outdir = Path(outdir)
         self.duration = duration      # 最长录制秒数，0 = 不限
         self.headless = headless
         self.start_ts = start_ts      # 定时开始的时间戳，None = 立即开始
-        self.danmode = danmode or "clean"   # clean=纯净原始流 / view=观看视角(含弹幕)
-        self.quality = quality if quality in QUALITY_KEYS else "origin"
+        self.danmode = danmode or "clean"   # clean=纯净原始流 / clean_dm=纯净流+弹幕TXT
 
         self.stream_url = None        # 拦截到的拉流地址
         self.stream_kind = None       # "flv" / "m3u8"
@@ -281,6 +332,11 @@ class LiveRecorder:
         self._context = None
         self._page = None
 
+        # clean_dm 模式：弹幕接口采集（(本地接收时刻, 服务端时刻, 昵称, 内容) 列表）
+        self._danmaku = []
+        self._dm_warned = False       # 钩子未生效只告警一次
+        self._part_t0 = {}            # 片段文件路径 -> 该段开始时刻（本地时间戳）
+
     # ---------- 浏览器 ----------
 
     def start_browser(self):
@@ -288,21 +344,6 @@ class LiveRecorder:
         self._pw = sync_playwright().start()
         args = ["--disable-blink-features=AutomationControlled"]
         vp = {"width": 1600, "height": 900}
-        if self.danmode == "view":
-            # 观看视角：窗口钉在固定位置，gdigrab 按同一区域采集画面；
-            # 小屏幕（如 1366x768）放不下固定窗口时收缩窗口与视口，避免弹幕被切掉
-            w, h = VIEW_WIN[2], VIEW_WIN[3]
-            if ctypes is not None:
-                scale = os_display_scale()   # 顺便把进程设为 DPI 感知
-                scr_w = ctypes.windll.user32.GetSystemMetrics(0) / scale
-                scr_h = ctypes.windll.user32.GetSystemMetrics(1) / scale
-                w = min(w, int(scr_w) - VIEW_WIN[0] - 10)
-                h = min(h, int(scr_h) - VIEW_WIN[1] - 10)
-                if (w, h) != (VIEW_WIN[2], VIEW_WIN[3]):
-                    log(f"屏幕偏小，观看视角窗口收缩为 {w}x{h}")
-            args += [f"--window-position={VIEW_WIN[0]},{VIEW_WIN[1]}",
-                     f"--window-size={w},{h}"]
-            vp = {"width": max(960, w - 20), "height": max(540, h - 120)}
         self._browser = self._pw.chromium.launch(
             headless=self.headless,
             args=args,
@@ -317,6 +358,9 @@ class LiveRecorder:
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         # 任何页面发出的拉流请求都能收到
         self._context.on("request", self._on_request)
+        # clean_dm：页面加载前注入弹幕钩子（包装 WebSocket/Worker，旁听弹幕接口）
+        if self.danmode == "clean_dm":
+            self._context.add_init_script(self._DM_HOOK_JS)
         self._page = self._context.new_page()
 
         # 先访问一次抖音拿域，再注入 cookies，刷新生效
@@ -414,7 +458,7 @@ class LiveRecorder:
             return None
         if not isinstance(urls, dict):
             return None
-        for key in QUALITY_KEYS.get(self.quality, QUALITY_KEYS["origin"]):
+        for key in QUALITY_KEYS:
             u = urls.get(key)
             if u and ".flv?" in u:
                 return u
@@ -586,6 +630,164 @@ class LiveRecorder:
         except Exception:
             pass
 
+    # ---------- 纯净流+弹幕（clean_dm）----------
+    #
+    # 弹幕从抖音直播的 IM WebSocket 接口拿：通过页面 JS 钩子包装
+    # WebSocket / Worker 构造器，旁听页面（含 Web Worker 内）建立的
+    # 弹幕连接，截获二进制 protobuf 帧并最小化解析，
+    # 只取 WebcastChatMessage（观众发言）。签名由页面自己完成，
+    # 我们是被动的旁听者，不额外发请求，抗接口签名变动。
+    #
+    # 为什么不用 Playwright 的 websocket 事件：实测抖音把弹幕 IM
+    # 连接建在 Web Worker 里，Playwright 的事件层收不到 Worker 内
+    # 建立的连接，只能在页面里挂钩子转发出来。
+
+    # 页面加载前注入：包装 WebSocket（只挂钩 douyin 域的连接），
+    # 二进制帧转 base64 存入 window.__dmFrames；
+    # 包装 Worker：先在 Worker 里装同样的钩子再 importScripts 原脚本，
+    # Worker 内收到的帧 base64 转发回主线程同一个缓冲。
+    _DM_HOOK_JS = r"""
+(() => {
+  if (window.__dmHook) return;
+  window.__dmHook = true;
+  window.__dmFrames = [];
+  const frameToB64 = (data) => {
+    let buf;
+    if (data instanceof ArrayBuffer) buf = new Uint8Array(data);
+    else if (data instanceof Blob) {
+      data.arrayBuffer().then(ab => frameToB64(ab)).catch(() => {});
+      return;
+    } else if (data && data.buffer instanceof ArrayBuffer && data.byteLength !== undefined) {
+      buf = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else return;
+    try {
+      let s = '';
+      for (let i = 0; i < buf.length; i += 0x8000)
+        s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+      window.__dmFrames.push(btoa(s));
+    } catch (e) {}
+  };
+  const isDouyin = (u) => { try { return String(u).includes('douyin'); } catch (e) { return false; } };
+
+  const NativeWS = window.WebSocket;
+  const PatchedWS = function (url, proto) {
+    const ws = proto === undefined ? new NativeWS(url) : new NativeWS(url, proto);
+    if (isDouyin(url)) {
+      try { ws.addEventListener('message', e => frameToB64(e.data)); } catch (e) {}
+    }
+    return ws;
+  };
+  PatchedWS.prototype = NativeWS.prototype;
+  try { PatchedWS.CONNECTING = 0; PatchedWS.OPEN = 1; PatchedWS.CLOSING = 2; PatchedWS.CLOSED = 3; } catch (e) {}
+  window.WebSocket = PatchedWS;
+
+  // Worker 包装：blob 代理脚本先装钩子再加载原脚本（module worker 无法代理，放行）
+  const NativeWorker = window.Worker;
+  window.Worker = function (url, opts) {
+    if (opts && opts.type === 'module') return new NativeWorker(url, opts);
+    let abs;
+    try { abs = new URL(url, location.href).href; } catch (e) { return new NativeWorker(url, opts); }
+    try {
+      const shim =
+        'var __push=function(data){' +
+        'try{var buf;' +
+        'if(data instanceof ArrayBuffer)buf=new Uint8Array(data);' +
+        'else if(data instanceof Blob){data.arrayBuffer().then(function(ab){__push(ab);}).catch(function(){});return;}' +
+        'else if(data&&data.buffer instanceof ArrayBuffer&&data.byteLength!==undefined)' +
+        'buf=new Uint8Array(data.buffer,data.byteOffset,data.byteLength);' +
+        'else return;' +
+        "var s='';for(var i=0;i<buf.length;i+=0x8000)s+=String.fromCharCode.apply(null,buf.subarray(i,i+0x8000));" +
+        'self.postMessage({__dm:btoa(s)});' +
+        '}catch(e){}};' +
+        'var NativeWS=self.WebSocket;' +
+        'self.WebSocket=function(u,p){' +
+        'var ws=p===undefined?new NativeWS(u):new NativeWS(u,p);' +
+        "try{if(String(u).indexOf('douyin')>=0)ws.addEventListener('message',function(e){__push(e.data);});}catch(e){}" +
+        'return ws;};' +
+        'self.WebSocket.prototype=NativeWS.prototype;';
+      const blob = new Blob([shim + 'importScripts(' + JSON.stringify(abs) + ');'],
+                            {type: 'text/javascript'});
+      const w = new NativeWorker(URL.createObjectURL(blob));
+      w.addEventListener('message', e => {
+        if (e && e.data && typeof e.data.__dm === 'string') window.__dmFrames.push(e.data.__dm);
+      });
+      return w;
+    } catch (e) {
+      return new NativeWorker(url, opts);
+    }
+  };
+})();
+"""
+
+    # 排空帧缓冲 + 顺带暂停播放（一次 evaluate 干两件事，每 2 秒调一次）
+    _DM_DRAIN_JS = """
+() => {
+  const frames = window.__dmFrames || [];
+  window.__dmFrames = [];
+  document.querySelectorAll('video').forEach(v => { v.pause(); v.muted = true; v.volume = 0; });
+  return {hook: !!window.__dmHook, frames: frames};
+}
+"""
+
+    def _drain_danmaku(self):
+        """把页面钩子缓冲的弹幕帧搬回 Python 解析，顺带维持页面暂停。
+
+        钩子未生效时告警一次；页面正在跳转/失败时静默跳过，不影响录制。
+        """
+        if self.danmode != "clean_dm" or self._page is None:
+            return
+        try:
+            res = self._page.evaluate(self._DM_DRAIN_JS)
+        except Exception:
+            return
+        if not res:
+            return
+        if not res.get("hook") and not self._dm_warned:
+            self._dm_warned = True
+            log("⚠️ 弹幕钩子未生效（页面可能限制了脚本注入），本次录制可能采不到弹幕")
+        for b64 in res.get("frames") or []:
+            try:
+                frame = base64.b64decode(b64)
+            except Exception:
+                continue
+            for _method, (create_ts, nick, content) in _pb_extract_messages(frame):
+                if not content:
+                    continue
+                recv = time.time()
+                # 服务端 create_time 缺失/异常时退回本地接收时刻
+                ts = create_ts if 1_500_000_000 < create_ts < 4_000_000_000 else recv
+                self._danmaku.append((recv, ts, nick, content))
+
+    def _write_txt_files(self, pairs):
+        """收尾时按片段写弹幕 TXT：相对秒 + 绝对时间 + 昵称 + 内容。"""
+        t0s = sorted(self._part_t0.values())
+        for raw, final in pairs:
+            t0 = self._part_t0.get(str(raw))
+            if t0 is None:
+                continue
+            target = final or raw
+            if not target or not Path(str(target)).exists():
+                continue
+            nxt = next((v for v in t0s if v > t0), None)
+            msgs = [m for m in self._danmaku if t0 <= m[0] and (nxt is None or m[0] < nxt)]
+            if not msgs:
+                log(f"  （{Path(str(target)).name} 时段内未采集到弹幕，跳过弹幕文件）")
+                continue
+            txt = Path(str(target)).with_suffix(".txt")
+            try:
+                with open(txt, "w", encoding="utf-8") as f:
+                    f.write(f"# 纯净流弹幕记录（来源：抖音直播弹幕接口）\n")
+                    f.write(f"# 片段: {Path(str(target)).name}\n")
+                    f.write(f"# 片段开始: {datetime.fromtimestamp(t0):%Y-%m-%d %H:%M:%S}\n")
+                    f.write("# 列: 相对时间(秒)\t绝对时间\t昵称\t内容\n")
+                    for recv, create, nick, content in msgs:
+                        rel = max(0.0, recv - t0)
+                        abs_s = datetime.fromtimestamp(create).strftime("%Y-%m-%d %H:%M:%S")
+                        f.write(f"{rel:.2f}\t{abs_s}\t{nick}\t{content}\n")
+                log(f"  ✓ {txt.name}（弹幕记录，{len(msgs)} 条，含相对/绝对时间）")
+            except OSError as e:
+                log(f"  ✗ 弹幕文件写入失败 {txt.name}: {e}")
+
     def _page_text(self):
         try:
             return self._page.evaluate("() => document.body ? document.body.innerText : ''")
@@ -651,6 +853,7 @@ class LiveRecorder:
         log("=" * 60)
         log("录制结束，处理文件...")
         final_files = []
+        pairs = []   # (登记时的片段路径, 收尾后的最终文件)，clean_dm 生成弹幕字幕用
         for f in self._finished:
             if not f.exists():
                 continue
@@ -663,15 +866,19 @@ class LiveRecorder:
                     log(f"  ✓ {mp4.name}（{mp4.stat().st_size/1048576:.1f} MB，"
                         f"已从 flv 无损转封装）")
                     final_files.append(mp4)
+                    pairs.append((f, mp4))
                     continue
             final_files.append(f)
+            pairs.append((f, f))
             log(f"  ✓ {f.name}（{f.stat().st_size/1048576:.1f} MB）")
         if final_files:
             log(f"共 {len(final_files)} 个文件，保存在: {self.outdir}")
-            if self.danmode == "view":
-                log("画面为播放器视角（含弹幕等界面元素），声音来自原始直播流")
+            if self.danmode == "clean_dm":
+                log("录制的是直播原始流：无弹幕、无界面元素；弹幕已从接口同步采集为同名 .txt 文件")
             else:
                 log("录制的是直播原始流：无弹幕、无评论、无在线人数、无任何界面元素")
+            if self.danmode == "clean_dm":
+                self._write_txt_files(pairs)
         else:
             log("没有可保留的录制文件")
         log("=" * 60)
@@ -706,14 +913,18 @@ class LiveRecorder:
                             f.write(chunk)
                             size += len(chunk)
                         if time.time() - last_report >= 15:
-                            log(f"  录制中... 已录 {size/1048576:.1f} MB")
+                            extra = (f"，已采集弹幕 {len(self._danmaku)} 条"
+                                     if self.danmode == "clean_dm" else "")
+                            log(f"  录制中... 已录 {size/1048576:.1f} MB{extra}")
                             last_report = time.time()
                         if time.time() - last_stopchk >= 2:
                             self._poll_stop()   # 收到停止请求会抛 KeyboardInterrupt
+                            self._drain_danmaku()   # clean_dm：拉弹幕帧 + 维持页面暂停
                             last_stopchk = time.time()
                         if self._time_up():
                             break
         finally:
+            self._drain_danmaku()
             if tmp.exists() and tmp.stat().st_size > 0:
                 tmp.rename(base_path.with_suffix(".flv"))
         return size
@@ -730,6 +941,7 @@ class LiveRecorder:
         try:
             while proc.poll() is None and not self._time_up():
                 self._poll_stop()
+                self._drain_danmaku()   # clean_dm：拉弹幕帧 + 维持页面暂停
                 time.sleep(2)
         finally:
             if proc.poll() is None:
@@ -738,637 +950,10 @@ class LiveRecorder:
                     proc.wait(timeout=10)
                 except Exception:
                     proc.kill()
+            self._drain_danmaku()
         if mp4.exists() and mp4.stat().st_size > 10240:
             return mp4.stat().st_size
         return 0
-
-    # ---------- 观看视角录制 ----------
-
-    _PLAYER_RECT_JS = """
-() => {
-  const v = document.querySelector('video');
-  if (!v) return null;
-  const r = v.getBoundingClientRect();
-  if (r.width < 100 || r.height < 100) return null;
-  return {left: r.left, top: r.top, width: r.width, height: r.height};
-}
-"""
-
-    def _find_chrome_hwnd(self):
-        """按页面标题找到浏览器顶层窗口句柄（窗口标题包含页面标题）。
-
-        为什么不用 window.screenX：Playwright 用模拟视口时这些值是假的
-        （实测会返回 -21333 之类的乱值），必须从操作系统侧拿真实坐标。
-        """
-        if ctypes is None:
-            return None
-        try:
-            title = self._page.title()
-        except Exception:
-            return None
-        if not title:
-            return None
-        user32 = ctypes.windll.user32
-        matches = []
-
-        def cb(hwnd, _):
-            if user32.IsWindowVisible(hwnd):
-                n = user32.GetWindowTextLengthW(hwnd)
-                if n:
-                    buf = ctypes.create_unicode_buffer(n + 1)
-                    user32.GetWindowTextW(hwnd, buf, n + 1)
-                    if title in buf.value:
-                        matches.append(hwnd)
-            return True
-
-        CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
-                                     ctypes.c_void_p)
-        try:
-            user32.EnumWindows(CMPFUNC(cb), None)
-        except Exception:
-            return None
-        if not matches:
-            return None
-        # 多个窗口标题都匹配时，取面积最大的（主窗口）
-        best, best_area = None, 0
-        rect = ctypes.wintypes.RECT()
-        for h in matches:
-            if user32.GetWindowRect(h, ctypes.byref(rect)):
-                area = max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
-                if area > best_area:
-                    best, best_area = h, area
-        return best
-
-    def _viewport_origin(self, hwnd):
-        """拿网页视口原点的屏幕物理像素坐标。
-
-        Chromium 主窗口客户区包含标签栏/地址栏，而 getBoundingClientRect
-        是相对网页视口的。Chromium 有个子窗口 Chrome_RenderWidgetHostHWND
-        对应网页渲染区，对它做 ClientToScreen 得到的就是视口原点。
-        拿不到子窗口时退回主窗口客户区原点（会偏移一个工具栏高度）。
-        """
-        user32 = ctypes.windll.user32
-        target = []
-
-        def child_cb(child, _):
-            buf = ctypes.create_unicode_buffer(64)
-            user32.GetClassNameW(child, buf, 64)
-            if buf.value == "Chrome_RenderWidgetHostHWND":
-                target.append(child)
-            return True
-
-        CMPFUNC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p,
-                                     ctypes.c_void_p)
-        try:
-            user32.EnumChildWindows(hwnd, CMPFUNC(child_cb), None)
-        except Exception:
-            pass
-        pt = ctypes.wintypes.POINT(0, 0)
-        probe = target[0] if target else hwnd
-        if not user32.ClientToScreen(probe, ctypes.byref(pt)):
-            return None
-        return (pt.x, pt.y)
-
-    def _visible_window_bounds(self, hwnd):
-        """窗口的可见边界（DWM 扩展帧边界，物理像素），失败退回 GetWindowRect。
-
-        WGC 按窗口采集出的帧边界与 DWM 可见边界一致，而 GetWindowRect
-        还包含左右约 7px 的不可见拖拽边框，算裁剪偏移必须用前者对齐。
-        """
-        user32 = ctypes.windll.user32
-        rect = ctypes.wintypes.RECT()
-        try:
-            hr = ctypes.windll.dwmapi.DwmGetWindowAttribute(
-                ctypes.c_void_p(hwnd), ctypes.c_uint(9),  # DWMWA_EXTENDED_FRAME_BOUNDS
-                ctypes.byref(rect), ctypes.sizeof(rect))
-        except Exception:
-            hr = -1
-        if hr != 0:
-            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                return None
-        return (rect.left, rect.top, rect.right, rect.bottom)
-
-    def _player_crop_rect(self):
-        """WGC 用：播放器区域相对窗口采集帧的裁剪矩形（物理像素）。
-
-        WGC 帧原点是窗口左上角，与窗口在屏幕上的位置无关，因此窗口
-        被移动甚至被遮挡都不影响裁剪；偏移 = 视口原点 - 窗口可见边界
-        左上角 + 播放器 CSS 偏移 × 显示缩放。宽高取偶避免 yuv420p 报错。
-        取不到播放器返回 None（WGC 模式不做整窗兜底，禁止标签栏入镜）。
-        """
-        info = None
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            try:
-                info = self._page.evaluate(self._PLAYER_RECT_JS)
-            except Exception:
-                info = None
-            if info:
-                break
-            time.sleep(1)
-        if not info:
-            return None
-        hwnd = self._find_chrome_hwnd()
-        if hwnd is None:
-            return None
-        origin = self._viewport_origin(hwnd)
-        if origin is None:
-            return None
-        bounds = self._visible_window_bounds(hwnd)
-        if bounds is None:
-            return None
-        scale = os_display_scale()
-        cx = origin[0] - bounds[0] + round(info["left"] * scale)
-        cy = origin[1] - bounds[1] + round(info["top"] * scale)
-        w = round(info["width"] * scale) // 2 * 2
-        h = round(info["height"] * scale) // 2 * 2
-        if w < 320 or h < 240:
-            return None
-        return (cx, cy, w, h)
-
-    def _wgc_start(self, hwnd, crop, proc):
-        """启动 WGC 窗口采集，把帧裁剪后写入 ffmpeg stdin（rawvideo bgra）。
-
-        回调运行在采集线程，frame_buffer 是零拷贝视图，回调返回后即失效，
-        必须当场裁剪并写出。按 30fps 节流丢帧，保证 rawvideo 时间轴正确。
-        返回 (capture_control, state_dict)，state.closed=True 表示窗口已关闭。
-        """
-        import windows_capture as wc
-
-        state = {"closed": False, "frames": 0, "errors": 0, "clamped": False}
-        cx, cy, w, h = crop
-        box = [cx, cy, cx + w, cy + h]   # x0,y0,x1,y1，首帧时夹取到帧范围内
-        interval = 1.0 / 30
-        last = [0.0]
-
-        def on_frame(frame, capture_control):
-            if state["errors"] >= 5:
-                capture_control.stop()
-                return
-            if not state["clamped"]:
-                # 窗口部分出屏时 WGC 帧只含屏内部分，裁剪框越界会让切片
-                # 尺寸悄悄变小、与 ffmpeg 声明的 rawvideo 尺寸不符，先夹取
-                state["clamped"] = True
-                x0, y0 = max(0, box[0]), max(0, box[1])
-                x1 = min(frame.width, box[2])
-                y1 = min(frame.height, box[3])
-                if (x0, y0, x1, y1) != tuple(box):
-                    log(f"⚠️ 播放器区域超出窗口采集帧，已夹取，"
-                        f"可能录不完整（窗口部分在屏幕外？）")
-                box[0], box[1], box[2], box[3] = x0, y0, x1, y1
-            now = time.time()
-            if now - last[0] < interval - 0.002:
-                return
-            last[0] = now
-            try:
-                proc.stdin.write(
-                    frame.frame_buffer[box[1]:box[3], box[0]:box[2]].tobytes())
-                state["frames"] += 1
-            except Exception:
-                # ffmpeg 已退出（正常收尾关管道后属正常情况）
-                state["errors"] += 1
-
-        def on_closed():
-            state["closed"] = True
-
-        cap = wc.WindowsCapture(cursor_capture=False, draw_border=False,
-                                window_hwnd=hwnd)
-        cap.frame_handler = on_frame
-        cap.closed_handler = on_closed
-        ctrl = cap.start_free_threaded()
-        return ctrl, state
-
-
-    def _set_browser_topmost(self, top):
-        """把浏览器窗口置顶（top=True）或取消置顶（top=False）。
-
-        gdigrab 抓的是屏幕上该区域的实际像素，任何窗口盖住浏览器都会被
-        录进去，因此每段开录前必须置顶；录完恢复普通层级，不干扰日常使用。
-        """
-        if ctypes is None:
-            return
-        try:
-            hwnd = self._find_chrome_hwnd()
-            if not hwnd:
-                log("⚠️ 未找到浏览器窗口句柄，无法置顶，请勿遮挡弹出的窗口")
-                return
-            user32 = ctypes.windll.user32
-            if top:
-                user32.SetForegroundWindow(hwnd)
-            user32.SetWindowPos(hwnd, -1 if top else -2, 0, 0, 0, 0,
-                                0x0001 | 0x0002 | 0x0040)  # SWP_NOSIZE|NOMOVE|SHOWWINDOW
-            if top:
-                log("浏览器窗口已置顶，录制期间请勿在该窗口内做任何操作")
-        except Exception:
-            pass
-
-    def _player_capture_rect(self, grab_scale):
-        """算出播放器（画面+弹幕层，两者重合）在屏幕上的 gdigrab 采集区域。
-
-        坐标换算：Playwright 强制 deviceScaleFactor=1，页面 CSS 像素就是
-        逻辑像素（DIP）；视口原点由 Win32 ClientToScreen 提供（物理像素），
-        元素偏移再乘 grab_scale（显示缩放）换算成物理像素。宽高取偶，
-        避免 x264/yuv420p 报奇数尺寸错误。取不到播放器返回 None。
-        """
-        info = None
-        deadline = time.time() + 8
-        while time.time() < deadline:
-            try:
-                info = self._page.evaluate(self._PLAYER_RECT_JS)
-            except Exception:
-                info = None
-            if info:
-                break
-            time.sleep(1)
-        if not info:
-            return None
-
-        hwnd = self._find_chrome_hwnd()
-        if hwnd is None:
-            return None
-        origin = self._viewport_origin(hwnd)
-        if origin is None:
-            return None
-        x = origin[0] + round(info["left"] * grab_scale)
-        y = origin[1] + round(info["top"] * grab_scale)
-        w = round(info["width"] * grab_scale) // 2 * 2
-        h = round(info["height"] * grab_scale) // 2 * 2
-        if w < 320 or h < 240:
-            return None
-        return (x, y, w, h)
-
-    def _probe_grab_scale(self):
-        """探测 ffmpeg gdigrab 的坐标体系：物理像素还是 DPI 虚拟化的逻辑像素。
-
-        先把本进程设为 DPI 感知拿到主屏物理宽度，再让 ffmpeg 抓一帧全屏，
-        对比抓出来的宽度：等于物理宽度说明 ffmpeg 按物理像素采集（乘显示
-        缩放），等于逻辑宽度说明被 DPI 虚拟化（乘 1）。探测失败按物理处理。
-        """
-        scale = os_display_scale()
-        if ctypes is None:
-            return scale
-        try:
-            phys_w = ctypes.windll.user32.GetSystemMetrics(0)  # SM_CXSCREEN
-        except Exception:
-            return scale
-        probe = Path(os.environ.get("TEMP", ".")) / "_gdigrab_probe.png"
-        try:
-            subprocess.run(
-                [ffmpeg_cmd(), "-y", "-loglevel", "error", "-f", "gdigrab",
-                 "-i", "desktop", "-frames", "1", str(probe)],
-                capture_output=True, timeout=30)
-            with open(probe, "rb") as fh:
-                head = fh.read(24)
-            probe.unlink(missing_ok=True)
-            w = int.from_bytes(head[16:20], "big")
-            if abs(w - phys_w) <= 2:
-                return scale
-            if abs(w - round(phys_w / scale)) <= 2:
-                return 1.0
-        except Exception:
-            pass
-        log("⚠️ 无法确认 ffmpeg 屏幕坐标体系，按物理像素处理")
-        return scale
-
-    # 档位叶子元素定位：返回可见的档位按钮/菜单项中心坐标（tier 为空查当前按钮）。
-    # 只认播放器区域内的同名元素，避免误点弹幕/评论里的相同文字。
-    _TIER_RECT_JS = """
-(tier) => {
-  const TS = ['原画','蓝光','超清','高清','标清'];
-  const vis = e => e.offsetParent !== null || e.getClientRects().length;
-  const vid = document.querySelector('video');
-  const vr = vid ? vid.getBoundingClientRect() : null;
-  const leaf = [...document.querySelectorAll('div,span')].filter(e => {
-    const t = (e.textContent || '').trim();
-    if (!(tier ? t === tier : TS.includes(t)) || !vis(e)) return false;
-    if ([...e.children].some(c => TS.includes((c.textContent || '').trim()))) return false;
-    if (vr) {
-      const r = e.getBoundingClientRect();
-      const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
-      if (cx < vr.x || cx > vr.x + vr.width || cy < vr.y || cy > vr.y + vr.height) return false;
-    }
-    return true;
-  });
-  if (!leaf.length) return null;
-  const r = leaf[0].getBoundingClientRect();
-  return {t: leaf[0].textContent.trim(), x: r.x + r.width / 2, y: r.y + r.height / 2};
-}
-"""
-
-    def _switch_player_quality(self):
-        """把网页播放器切到最高档（原画→蓝光→超清），尽力而为，失败不影响录制。
-
-        播放器默认放标清且清晰度菜单靠悬停展开，JS click() 触发不了，
-        必须用真实鼠标事件：悬停档位按钮等菜单出现，再点最高档。
-        """
-        try:
-            # 控制栏默认隐藏，档位按钮不可见时先悬停播放器中央唤出控制栏再找，
-            # 带重试；页面刚加载时控件可能尚未渲染
-            cur = None
-            deadline = time.time() + 6
-            while time.time() < deadline and not cur:
-                cur = self._page.evaluate(self._TIER_RECT_JS, None)
-                if not cur:
-                    vr = self._page.evaluate(
-                        "() => { const v = document.querySelector('video');"
-                        " if (!v) return null; const r = v.getBoundingClientRect();"
-                        " return {x: r.x + r.width / 2, y: r.y + r.height / 2}; }")
-                    if vr:
-                        self._page.mouse.move(vr["x"], vr["y"])
-                    time.sleep(1.0)
-            if not cur:
-                log("⚠️ 未找到播放器清晰度控件，保持默认画质录制")
-                return
-            self._page.mouse.move(cur["x"], cur["y"])
-            time.sleep(0.8)
-            # 按所选档位优先点击，缺档时向更高档回落、再向低档回落
-            tiers = {"origin": ["原画", "蓝光", "超清"],
-                     "super": ["超清", "蓝光", "原画"],
-                     "high": ["高清", "超清", "蓝光", "原画"],
-                     "standard": ["标清", "高清", "超清", "蓝光", "原画"]
-                     }.get(self.quality, ["原画", "蓝光", "超清"])
-            for tier in tiers:
-                r = self._page.evaluate(self._TIER_RECT_JS, tier)
-                if r:
-                    self._page.mouse.move(r["x"], r["y"])
-                    time.sleep(0.3)
-                    self._page.mouse.click(r["x"], r["y"])
-                    time.sleep(2.0)
-                    # 鼠标移开，避免控制栏一直显示在录制画面里
-                    self._page.mouse.move(10, 10)
-                    log(f"播放器清晰度已切到「{r['t']}」")
-                    return
-            self._page.mouse.move(10, 10)  # 没有更高档，移开鼠标收起菜单
-        except Exception:
-            pass
-
-    def _audio_relay_start(self, url):
-        """把直播流音频转成 mpegts 打到本地 UDP 回环，供主 ffmpeg 作音源。
-
-        直播 flv 连接偶发被服务端重置，若把流地址直接交给主 ffmpeg，断流
-        在 -shortest 下会整段截断。中转进程断流后自动重启续流（重启间隙
-        静音），墙钟时间戳保证跨重启时间轴连续，主画面录制不受影响。
-        返回控制句柄：置 relay["stop"]=True 结束；relay["pulled"] 表示已
-        拉到流；relay["dead"] 表示重试耗尽（之后录制继续但无声）。
-        """
-        port = random.randint(20000, 40000)
-        state = {"port": port, "stop": False, "pulled": False,
-                 "dead": False, "proc": None}
-        dst = f"udp://127.0.0.1:{port}?pkt_size=1316"
-
-        def loop():
-            fails = 0
-            while not state["stop"] and fails < 10:
-                try:
-                    p = subprocess.Popen(
-                        [ffmpeg_cmd(), "-loglevel", "error",
-                         "-use_wallclock_as_timestamps", "1",
-                         "-user_agent", UA,
-                         "-headers", "Referer: https://live.douyin.com/\r\n",
-                         "-i", url, "-vn", "-c:a", "copy",
-                         "-f", "mpegts", dst],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    fails += 1
-                    time.sleep(2)
-                    continue
-                state["proc"] = p
-                time.sleep(1.5)   # 短暂存活即认为拉到流（坏地址秒退）
-                if p.poll() is None:
-                    state["pulled"] = True
-                while p.poll() is None and not state["stop"]:
-                    time.sleep(0.5)
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                if state["stop"]:
-                    break
-                fails += 1
-                time.sleep(1)   # 断流重启间隙
-            state["dead"] = fails >= 10
-
-        threading.Thread(target=loop, daemon=True).start()
-        return state
-
-    def _record_viewmode(self, room_id):
-        """观看视角录制：录浏览器窗口画面（含弹幕/礼物特效）+ 原始流声音。
-
-        优先用 WGC 按窗口句柄采集：窗口被遮挡也能录，无需置顶（但最小化
-        会让窗口停止渲染，录不到画面）。WGC 不可用时回退 gdigrab 抓屏 +
-        置顶。一个 ffmpeg 进程同时采集画面和直播流声音，直接输出 mp4。
-        """
-        if not has_ffmpeg():
-            log("❗观看视角录制需要 ffmpeg（用于画面采集），未检测到 ffmpeg")
-            log("   重新运行「打开爬虫界面.bat」会自动装上，或改用「纯净原始流」模式")
-            return
-        vx, vy, vw, vh = VIEW_WIN
-        use_wgc = wgc_available()
-        grab_scale = None   # gdigrab 坐标体系探测，回退路径首次用到时再测
-        if use_wgc:
-            log("画面采集：WGC 窗口采集（窗口可以被其他窗口遮挡，保持不最小化即可）")
-        else:
-            log("WGC 不可用（需 Win10 1903+，pip install windows-capture），"
-                "回退 gdigrab 抓屏")
-            log("⚠️ 录制期间请不要移动、最小化或遮挡弹出的浏览器窗口")
-        log("观看视角模式：只录播放器画面（含弹幕），声音来自原始直播流")
-        # 网页播放器默认放标清，先切到最高档再录，避免录出来糊
-        self._switch_player_quality()
-        # 页面取消静音，和平时看直播一样（录制声音仍直接取自原始流，互不影响）
-        try:
-            self._page.evaluate(
-                "document.querySelectorAll('video').forEach(v=>{v.muted=false;v.volume=1;})")
-        except Exception:
-            pass
-
-        part, fails, recorded = 1, 0, 0
-        while fails < 3 and not self._time_up():
-            self._check_captcha()
-            log(f"寻找直播流（作为声音来源）...（第 {part} 段）")
-            _, url = self.wait_for_stream(20)
-            if not url:
-                cands = self._streams_from_page()
-                if cands:
-                    url = cands[0]
-            if not url:
-                if self._looks_not_live():
-                    if self._live_ended():
-                        log("主播已下播，结束录制")
-                        break
-                    log("主播当前没在直播，每 60 秒刷新等待开播...")
-                    wait_until = time.time() + 60
-                    while time.time() < wait_until and not self._time_up():
-                        self._poll_stop()
-                        time.sleep(2)
-                    self._reopen_room()
-                    # 重开页面后播放器回到默认标清，需重新切到最高档
-                    self._switch_player_quality()
-                    continue
-                log("拿不到直播流地址（观看视角的声音需要从直播流提取）")
-                self._check_captcha()
-                pause("  请看一眼浏览器窗口确认状态，按回车重试...")
-                fails += 1
-                continue
-
-            # 每段录制前重新定位播放器（页面重开/布局变化后位置会变）
-            backend = "wgc" if use_wgc else "gdigrab"
-            hwnd = crop = None
-            if backend == "wgc":
-                hwnd = self._find_chrome_hwnd()
-                crop = self._player_crop_rect() if hwnd else None
-                if not crop:
-                    # WGC 模式不做整窗兜底：整窗会把标签栏/地址栏录进去
-                    log("⚠️ 未能定位播放器区域（WGC 仅录播放器区域，不整窗兜底）")
-                    fails += 1
-                    time.sleep(2)
-                    continue
-                _, _, vw, vh = crop
-                log(f"已定位播放器区域：{vw}x{vh}（窗口内裁剪，不含浏览器标签栏/地址栏）")
-            else:
-                if grab_scale is None:
-                    grab_scale = self._probe_grab_scale()
-                region = self._player_capture_rect(grab_scale)
-                if region:
-                    vx, vy, vw, vh = region
-                    log(f"已定位播放器区域：({vx},{vy}) {vw}x{vh}（不含浏览器标签栏/地址栏）")
-                else:
-                    # VIEW_WIN 是窗口钉扎用的逻辑像素（DIP），同样要换算成 gdigrab 坐标
-                    vx, vy, vw, vh = (int(v * grab_scale) // 2 * 2 for v in VIEW_WIN)
-                    log(f"⚠️ 未能定位播放器，退回录制整窗区域 ({vx},{vy}) {vw}x{vh}")
-
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            mp4 = self.outdir / f"{room_id}_{stamp}_part{part}_观看视角.mp4"
-            self._finished.append(mp4)   # 先登记，任何退出路径统一收尾
-            if self.t_start is None:
-                self.t_start = time.time()
-                if self.duration:
-                    log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
-            log(f"✅ 开始观看视角录制 → {mp4.name}")
-            relay = None
-            if backend == "wgc":
-                # 音频经独立中转进程拉流转 mpegts，走本地 UDP 回环喂给主
-                # ffmpeg：直播 flv 连接偶发被服务端重置，直接交给主 ffmpeg
-                # 的话断流即截断；UDP 输入永不 EOF，断流由中转线程自动
-                # 重启续流，主画面照常录满设定时长
-                relay = self._audio_relay_start(url)
-                while (not relay["pulled"] and not relay["stop"]
-                       and not relay["dead"]):
-                    time.sleep(0.1)   # 主 ffmpeg 的 UDP 输入要等首包才开流
-                if relay["dead"] and not relay["pulled"]:
-                    log("⚠️ 音频源多次重试失败，本段不开录，稍后重试")
-                    relay["stop"] = True
-                    fails += 1
-                    continue
-                cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
-                       "-f", "rawvideo", "-pix_fmt", "bgra",
-                       "-video_size", f"{vw}x{vh}", "-framerate", "30",
-                       "-i", "-",
-                       "-f", "mpegts",
-                       "-i", (f"udp://127.0.0.1:{relay['port']}"
-                              "?listen=1&overrun_nonfatal=1&fifo_size=500000"),
-                       "-map", "0:v", "-map", "1:a", "-shortest",
-                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                       "-pix_fmt", "yuv420p",
-                       "-c:a", "aac", "-b:a", "160k",
-                       str(mp4)]
-            else:
-                self._set_browser_topmost(True)   # 开录前置顶，防止被遮挡录到别的窗口
-                cmd = [ffmpeg_cmd(), "-y", "-loglevel", "error",
-                       "-f", "gdigrab", "-framerate", "30",
-                       "-offset_x", str(vx), "-offset_y", str(vy),
-                       "-video_size", f"{vw}x{vh}", "-i", "desktop",
-                       "-user_agent", UA,
-                       "-headers", "Referer: https://live.douyin.com/\r\n",
-                       "-i", url,
-                       "-map", "0:v", "-map", "1:a",
-                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                       "-pix_fmt", "yuv420p",
-                       "-c:a", "aac", "-b:a", "160k",
-                       str(mp4)]
-            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                    stdout=subprocess.DEVNULL,
-                                    stderr=subprocess.DEVNULL)
-
-            def stop_ffmpeg():
-                # 必须让 ffmpeg 正常收尾（直接 kill 会丢 mp4 索引导致文件损坏）：
-                # gdigrab 的 stdin 空闲，写 q 触发收尾；WGC 的 stdin 是 rawvideo
-                # 视频流，写 q 会被当成帧数据，必须关管道以视频 EOF 收尾——
-                # 音频走本地 UDP 永不 EOF，配合 -shortest 视频 EOF 即正常
-                # 收尾退出，否则 ffmpeg 挂在无终止的音频输入上被强杀丢 moov
-                if proc.poll() is None:
-                    try:
-                        if backend == "wgc":
-                            proc.stdin.close()
-                        else:
-                            proc.stdin.write(b"q")
-                            proc.stdin.flush()
-                    except Exception:
-                        pass
-                    try:
-                        proc.wait(timeout=15)
-                    except Exception:
-                        proc.kill()
-
-            wgc_ctrl = None
-            wgc_state = None
-            last_report = time.time()
-            try:
-                if backend == "wgc":
-                    try:
-                        wgc_ctrl, wgc_state = self._wgc_start(hwnd, crop, proc)
-                    except Exception as e:
-                        # 本段作废（rawvideo 无数据），下段起回退 gdigrab+置顶
-                        log(f"⚠️ WGC 采集启动失败（{e}），本段作废，后续回退 gdigrab")
-                        use_wgc = False
-                while proc.poll() is None and not self._time_up():
-                    time.sleep(3)
-                    if mp4.exists() and time.time() - last_report >= 30:
-                        log(f"  录制中... {mp4.stat().st_size / 1048576:.1f} MB")
-                        last_report = time.time()
-                    if wgc_state and wgc_state["closed"]:
-                        log("浏览器窗口已关闭，停止录制")
-                        break
-                    if self._live_ended():
-                        log("页面显示直播已结束，停止录制")
-                        break
-                    self._check_captcha()
-                    self._poll_stop()
-            finally:
-                if relay is not None:
-                    relay["stop"] = True   # 先停音频中转，管道不再进数据
-                    try:
-                        relay["proc"].kill()
-                    except Exception:
-                        pass
-                if wgc_ctrl is not None:
-                    try:
-                        wgc_ctrl.stop()   # 先停采集，管道不再进帧
-                    except Exception:
-                        pass
-                stop_ffmpeg()   # 无论正常结束还是中断，都让 ffmpeg 写完 mp4 索引
-                if backend == "gdigrab":
-                    self._set_browser_topmost(False)   # 录完恢复普通窗口层级
-
-            size = mp4.stat().st_size if mp4.exists() else 0
-            if size >= 102400:
-                recorded += 1
-                log(f"  本段录制 {size / 1048576:.1f} MB")
-                if self._time_up():
-                    break
-                # 用户要求：流一断就收尾，不再找流重连
-                log("流断开了，直接收尾（按设定不再找流重连）")
-                break
-            else:
-                if mp4.exists() and size < 10240:
-                    mp4.unlink()
-                if recorded:
-                    log("本段没有录到有效数据，判定直播已结束，收尾")
-                    break
-                fails += 1
-                log(f"本段没有录到有效数据（{fails}/3），重试...")
-
-        if not recorded:
-            log("观看视角没有录到任何内容，退出")
 
     # ---------- 主流程 ----------
 
@@ -1404,10 +989,6 @@ class LiveRecorder:
                 # 主页链接/分享文案：先等开播，解析出直播间再录
                 room_url = self._wait_for_live(query)
                 room_id = self.open_room(room_url)
-            # 观看视角走独立流程（录屏幕画面，不下载原始流文件）
-            if self.danmode == "view":
-                self._record_viewmode(room_id)
-                return
             fails = 0
             part = 1
             while fails < 3 and not self._time_up():
@@ -1460,11 +1041,19 @@ class LiveRecorder:
                     if self.duration:
                         log(f"⏱ 开始计时：录 {self.duration // 60} 分钟")
                 log(f"✅ 已拿到{'视频流' if kind == 'flv' else 'HLS 流'}，开始录制 → {base.name}.*")
-                log("   （录制的是直播原始流，无弹幕、无评论、无在线人数等任何界面元素）")
-                # 录制只依赖拉流地址，页面切空白，停掉弹幕/动画/视频解码的开销
-                self._park_page()
+                log("   （录制的是直播原始流，无弹幕、无评论、无在线人数等任何界面元素）"
+                    if self.danmode != "clean_dm" else
+                    "   （录制直播原始流；弹幕接口监听中，收尾生成同名弹幕 TXT）")
+                if self.danmode == "clean_dm":
+                    # 页面留在直播间，JS 钩子旁听弹幕接口；evaluate 顺带暂停播放
+                    self._drain_danmaku()
+                else:
+                    # 录制只依赖拉流地址，页面切空白，停掉弹幕/动画/视频解码的开销
+                    self._park_page()
                 raw = base.with_suffix(".flv" if kind == "flv" else ".mp4")
                 self._finished.append(raw)   # 先登记，任何退出路径统一收尾
+                if self.danmode == "clean_dm":
+                    self._part_t0[str(raw)] = time.time()   # 该段弹幕时间从 0 起算的基准
                 try:
                     if kind == "flv":
                         size = self.record_flv(url, base)
@@ -1554,44 +1143,11 @@ def _selftest():
         ok = ok and good
         log(f"{'✅' if good else '❌'} {name}{('：' + detail) if detail else ''}")
 
-    # 1. ffmpeg（转封装 / 观看视角录屏都靠它）
+    # 1. ffmpeg（转封装靠它）
     report("ffmpeg", has_ffmpeg(),
            "" if has_ffmpeg() else "未找到（重跑「打开爬虫界面.bat」自动安装）")
 
-    # 2. 屏幕采集（观看视角模式依赖 gdigrab 抓屏）
-    probe = Path(os.environ.get("TEMP", ".")) / "_recorder_selftest.png"
-    try:
-        subprocess.run([ffmpeg_cmd(), "-y", "-loglevel", "error", "-f", "gdigrab",
-                        "-i", "desktop", "-frames", "1", str(probe)],
-                       capture_output=True, timeout=30)
-        good = probe.exists() and probe.stat().st_size > 10240
-        report("屏幕采集（gdigrab 抓帧）", good)
-    except Exception as e:
-        report("屏幕采集（gdigrab 抓帧）", False, str(e)[:80])
-    finally:
-        probe.unlink(missing_ok=True)
-
-    # 2b. WGC 窗口采集（观看视角优选：窗口可被遮挡、无需置顶）
-    if wgc_available():
-        good = False
-        detail = ""
-        try:
-            import windows_capture as wc
-            # 用桌面窗口做一次真实构造，验证本机 WGC 运行时确实可用
-            wc.WindowsCapture(cursor_capture=False, draw_border=False,
-                              window_hwnd=ctypes.windll.user32.GetShellWindow())
-            good = True
-        except Exception as e:
-            detail = str(e)[:80]
-        report("WGC 窗口采集（windows-capture）", good,
-               "可用，观看视角录制无需置顶" if good
-               else f"WGC 运行时不可用（{detail}），观看视角将回退 gdigrab+置顶")
-    else:
-        report("WGC 窗口采集（windows-capture）", False,
-               "未安装 windows-capture 或系统过旧（需 Win10 1903+），"
-               "观看视角将回退 gdigrab+置顶")
-
-    # 3. cookies
+    # 2. cookies
     ck = Path(__file__).parent / "cookies.txt"
     good = ck.exists() and ck.stat().st_size > 50
     report("cookies 文件", good,
@@ -1624,13 +1180,11 @@ def main():
                         help="输出目录（默认 脚本目录/downloads/live）")
     parser.add_argument("--headless", action="store_true",
                         help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
-    parser.add_argument("--danmode", choices=["clean", "view"], default="clean",
-                        help="录制视角：clean=纯净原始流(无弹幕) view=观看视角(画面含弹幕，录屏)")
+    parser.add_argument("--danmode", choices=["clean", "clean_dm"], default="clean",
+                        help="录制视角：clean=纯净原始流(无弹幕) "
+                             "clean_dm=纯净流+弹幕(原始流+弹幕接口采集的TXT记录，含相对/绝对时间)")
     parser.add_argument("--selftest", action="store_true",
-                        help="快速自检：ffmpeg/屏幕采集/cookies/网络是否可用（不录）")
-    parser.add_argument("--quality", choices=["origin", "super", "high", "standard"],
-                        default="origin",
-                        help="录制画质（默认 origin=原画）：super=超清 high=高清 standard=标清")
+                        help="快速自检：ffmpeg/cookies/网络是否可用（不录）")
     args = parser.parse_args()
     if args.selftest:
         sys.exit(0 if _selftest() else 1)
@@ -1662,9 +1216,10 @@ def main():
             elif m:
                 print(f"「{m}」不是数字，按不限时长处理")
         if not args.danmode or args.danmode == "clean":
-            d = input("录制视角：1=纯净原始流(无弹幕) 2=观看视角(画面含弹幕)（回车=1）: ").strip()
+            d = input("录制视角：1=纯净原始流(无弹幕) "
+                      "2=纯净流+弹幕(原始流+接口采集的弹幕TXT)（回车=1）: ").strip()
             if d == "2":
-                args.danmode = "view"
+                args.danmode = "clean_dm"
 
     start_ts = None
     if args.start:
@@ -1699,7 +1254,7 @@ def main():
     recorder = LiveRecorder(cookies, args.outdir,
                             duration=(args.minutes or 0) * 60,
                             headless=args.headless, start_ts=start_ts,
-                            danmode=args.danmode, quality=args.quality)
+                            danmode=args.danmode)
     try:
         recorder.run(query)
     except KeyboardInterrupt:
