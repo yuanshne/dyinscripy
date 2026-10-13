@@ -170,16 +170,19 @@ def classify_input(q):
 
 class DouyinSpider:
     def __init__(self, cookies, outdir, headless=False, limit=None,
-                 since=None, until=None):
+                 since=None, until=None, with_comments=False):
         self.cookies = cookies
         self.outdir = Path(outdir)
         self.headless = headless
         self.limit = limit
+        self.with_comments = with_comments  # 集成模式：下载作品后逐个抓取评论
         # 时间段过滤（"YYYY-MM-DD"，None 表示不限）
         self.since_ts = self._date_ts(since) if since else None
         self.until_ts = self._date_ts(until) + 86399 if until else None
 
         self.works = {}          # aweme_id -> aweme dict
+        self.target_sec = None   # 目标用户 sec_uid，兜底过滤非目标用户的作品
+        self.done_ids = set()    # 上次运行已下载过的 aweme_id（跨次去重）
         self.expect_vid = None   # 单视频/评论模式：只接受这个视频 id 的详情响应
         self.want_detail = True  # 评论模式关掉详情解析：大响应同步 json() 会阻塞
                                  # playwright 事件循环，导致懒加载的评论请求发不出
@@ -271,12 +274,20 @@ class DouyinSpider:
                         "aweme_count": user.get("aweme_count"),
                     }
             elif API_POST in url:
+                # 作品列表接口随时都收：主页一打开就会发出第一页（含全部
+                # 作品），此时可能还没进收集阶段，靠时间门禁会把它误杀掉，
+                # 导致滚动时只请求到空的第二页、一个作品都收不到。
+                # 候选用户主页的污染由 resolve_by_account 的快照法隔离
                 data = resp.json()
                 aweme_list = data.get("aweme_list") or []
                 new_cnt = 0
                 for aw in aweme_list:
                     awid = aw.get("aweme_id")
                     if awid and awid not in self.works:
+                        # 兜底校验：接口数据里带作者 sec_uid 且与目标不符的直接丢弃
+                        au = (aw.get("author") or {}).get("sec_uid")
+                        if self.target_sec and au and au != self.target_sec:
+                            continue
                         self.works[awid] = aw
                         new_cnt += 1
                 if data.get("has_more") in (0, False, "0", None):
@@ -286,10 +297,13 @@ class DouyinSpider:
             elif API_DETAIL in url and self.want_detail:
                 data = resp.json()
                 aw = data.get("aweme_detail") or {}
-                # 页面可能自动跳到推荐视频，只收目标视频，避免下错
-                if (aw.get("aweme_id")
-                        and (self.expect_vid is None
-                             or aw["aweme_id"] == self.expect_vid)):
+                # 详情接口只服务单视频模式（expect_vid 精确匹配）。主页模式
+                # 下 expect_vid 为 None，此时任何详情响应都是干扰——用户主页
+                # 自动弹开的视频浮层会预加载"相关推荐"视频（别人家视频）的
+                # 详情，收进来就会下载错的作品，还置 has_more=False 中断收集
+                if self.expect_vid is None:
+                    return
+                if aw.get("aweme_id") == self.expect_vid:
                     self.works[aw["aweme_id"]] = aw
                     self.has_more = False
                     self._last_post_resp = time.time()
@@ -423,7 +437,12 @@ class DouyinSpider:
         log(f"搜索到 {len(candidates)} 个候选用户，逐个核对抖音号...")
 
         fallback = None
+        last_prev_ids = set()
         for i, sec in enumerate(candidates, 1):
+            # 进候选页前快照：每个候选主页都会发出自己的作品列表接口，
+            # 不隔离的话前面候选（如搜索推荐里的其他账号）的作品会混进
+            # 目标用户的作品池，最后被一起下载
+            last_prev_ids = set(self.works)
             self.profile = None
             self._page.goto(f"https://www.douyin.com/user/{sec}",
                             wait_until="domcontentloaded", timeout=60000)
@@ -445,9 +464,15 @@ class DouyinSpider:
             nick = self.profile.get("nickname") or ""
             log(f"  候选 {i}: @{uid}（{nick}）")
             if uid == account:
+                # 只保留该候选页面访问期间收到的作品（目标主页自己的第一页
+                # 作品列表），此前其他候选页面的数据全部丢弃
+                self.works = {k: v for k, v in self.works.items()
+                              if k not in last_prev_ids}
                 log("  ✅ 抖音号精确匹配")
                 return self.profile
             if nick == account:
+                self.works = {k: v for k, v in self.works.items()
+                              if k not in last_prev_ids}
                 log("  ✅ 昵称匹配")
                 return self.profile
 
@@ -455,6 +480,9 @@ class DouyinSpider:
             log(f"⚠️ 没有精确匹配到抖音号「{account}」，将使用搜索排名第一的用户: "
                 f"@{fallback.get('unique_id')}（{fallback.get('nickname')}）")
             pause("  如果这不是你要的用户，请停止任务；确认无误就继续")
+            # 同理只保留最后访问的候选页面的作品（collect_works 滚动的是当前页）
+            self.works = {k: v for k, v in self.works.items()
+                          if k not in last_prev_ids}
             self.profile = fallback
             return fallback
         log("所有候选用户都拿不到资料（大概率 cookies 失效），退出")
@@ -508,10 +536,6 @@ class DouyinSpider:
             if not (hit and (hit.get("textHit") or hit.get("elHit"))):
                 return
         log("❗ 检测到验证页面！请在弹出的浏览器窗口里手动完成验证")
-        try:
-            self._page.screenshot(path=str(self.outdir / "验证页面截图.png"))
-        except Exception:
-            pass
         try:
             input("  完成后回到这里按回车继续...")
         except (EOFError, OSError):
@@ -691,7 +715,9 @@ class DouyinSpider:
         }
 
     def save_meta(self, tasks):
-        rows, json_rows = [], []
+        # 去重元数据是内部数据，不放下载目录：存到 downloads/.meta/<用户>/
+        # works.json，累积合并（按 aweme_id 去重，新记录覆盖同 id 旧记录）
+        json_rows = []
         for t in tasks:
             files_rel = []
             for f in t["files"]:
@@ -699,20 +725,22 @@ class DouyinSpider:
                     files_rel.append(str(f.relative_to(self.user_dir)))
                 except ValueError:
                     files_rel.append(str(f))
-            row = self.summarize_work(t["aweme"], files_rel)
-            rows.append(row)
-            json_rows.append(row)
+            json_rows.append(self.summarize_work(t["aweme"], files_rel))
 
-        csv_path = self.user_dir / "元数据.csv"
-        if rows:
-            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                writer.writeheader()
-                writer.writerows(rows)
-        (self.user_dir / "works.json").write_text(
-            json.dumps(json_rows, ensure_ascii=False, indent=2), encoding="utf-8")
-        log(f"元数据已保存: {csv_path}")
-        return csv_path
+        meta_dir = self.user_dir.parent / ".meta" / self.user_dir.name
+        meta_dir.mkdir(parents=True, exist_ok=True)
+        json_path = meta_dir / "works.json"
+        old_rows = []
+        if json_path.exists():
+            try:
+                old_rows = json.loads(json_path.read_text(encoding="utf-8"))
+            except Exception:
+                old_rows = []
+        new_ids = {r.get("aweme_id") for r in json_rows if r.get("aweme_id")}
+        merged = [r for r in old_rows if r.get("aweme_id") not in new_ids] + json_rows
+        json_path.write_text(
+            json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+        return json_path
 
     # ---------- 主流程 ----------
 
@@ -738,15 +766,50 @@ class DouyinSpider:
             self.images_dir = self.user_dir / "images"
             self.videos_dir.mkdir(parents=True, exist_ok=True)
             self.images_dir.mkdir(parents=True, exist_ok=True)
+            self.target_sec = (profile or {}).get("sec_uid")
+
+            # 跨次去重用的已下载作品 id（收集完成后统一比对剔除）。
+            # 元数据存 .meta 隐藏目录；旧版本存在用户目录下的 works.json
+            # 自动迁移过去，元数据.csv 不再生成
+            meta_path = self.outdir / ".meta" / safe_user / "works.json"
+            legacy_path = self.user_dir / "works.json"
+            if not meta_path.exists() and legacy_path.exists():
+                meta_path.parent.mkdir(parents=True, exist_ok=True)
+                legacy_path.replace(meta_path)
+            if meta_path.exists():
+                try:
+                    for row in json.loads(meta_path.read_text(encoding="utf-8")):
+                        if row.get("aweme_id"):
+                            self.done_ids.add(row["aweme_id"])
+                except Exception as e:
+                    log(f"读取上次元数据失败（{type(e).__name__}），跳过跨次去重")
 
             self.collect_works()
+            # 去重前快照全部作品：评论阶段要覆盖所有作品（含上次已下载过的，
+            # 否则先跑过一次不带评论的下载、再勾评论重跑时会一个都不抓）
+            vids_all = self._sorted_vid_list(self.works)
+
+            # 跨次去重：上次保存过元数据的作品（按 aweme_id）本次不再下载，
+            # 避免重跑时序号位移导致同名视频换个文件名重复下载
+            if self.done_ids:
+                dups = [k for k in self.works if k in self.done_ids]
+                for k in dups:
+                    del self.works[k]
+                if dups:
+                    log(f"跨次去重：{len(dups)} 个作品上次已下载过，本次自动跳过")
+
             if not self.works:
-                log("一个作品都没收集到，退出。建议检查 cookies 是否有效。")
+                if vids_all:
+                    # 没有新作品要下载，但勾选了评论：仍对全部作品补抓评论
+                    self._comments_phase(vids_all)
+                else:
+                    log("一个作品都没收集到，退出。建议检查 cookies 是否有效。")
                 return
 
             tasks = self.build_tasks()
             self.download_all(tasks)
             self.save_meta(tasks)
+            self._comments_phase(vids_all)
 
             n_video = sum(1 for t in tasks if t["type"] == "视频")
             n_img = sum(1 for t in tasks if t["type"] == "图片")
@@ -819,6 +882,9 @@ class DouyinSpider:
             tasks = self.build_tasks()
             self.download_all(tasks)
             self.save_meta(tasks)
+            self._comments_phase([(vid,
+                                   (aw.get("desc") or "").replace("\n", " "),
+                                   aw.get("create_time") or 0)])
             log(f"完成，保存位置: {self.user_dir}")
         finally:
             self.stop_browser()
@@ -890,6 +956,7 @@ class DouyinSpider:
             tasks = self.build_tasks()
             self.download_all(tasks)
             self.save_meta(tasks)
+            self._comments_phase(self._sorted_vid_list(self.works))
             log("=" * 60)
             log(f"搜索完成！共 {len(tasks)} 个作品，保存位置: {self.user_dir}")
             log("=" * 60)
@@ -944,6 +1011,7 @@ class DouyinSpider:
         }
 
     def run_comments(self, query):
+        """独立评论模式：只抓单个视频的评论，不下载作品"""
         vid = self.parse_video_id(query)
         if not vid:
             log("解析不出视频 id，请粘贴含 /video/ 或 /note/ 的链接或 App 分享文案")
@@ -954,109 +1022,174 @@ class DouyinSpider:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.start_browser()
         try:
-            url = f"https://www.douyin.com/video/{vid}"
-            log(f"打开视频页抓取评论: {url}")
-            self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            self._last_comment_resp = time.time()
-            deadline = time.time() + 30
-            # 评论区是懒加载且位于视频下方：需要先用页面级滚轮把评论区滚进
-            # 视野，再对列表发真实滚轮，评论接口才会发出。页面组件挂载时机
-            # 有波动，单次触发不可靠，改为每 5 秒重复触发直到有数据（实测验证）
-            last_kick = 0.0
+            self._comments_one_video(vid, self.outdir / "comments")
+        finally:
+            self.stop_browser()
+
+    def _comments_one_video(self, vid, csv_dir, csv_base=None):
+        """抓取单个视频的评论并导出 CSV（浏览器需已启动）。
+
+        独立评论模式与集成在视频爬取里的评论阶段共用本方法。
+        csv_base 为输出文件名主体（不含条数后缀），缺省用 评论_{vid}。
+        返回抓到的评论条数；出错时抛异常由调用方决定是否继续。
+        """
+        # 每个视频独立的评论状态（集成模式下连续抓多个视频）
+        self.comments = []
+        self._comment_seen = set()
+        self._pending_comment_resps = []
+        self.comment_has_more = True
+        csv_base = csv_base or f"评论_{vid}"
+
+        url = f"https://www.douyin.com/video/{vid}"
+        log(f"打开视频页抓取评论: {url}")
+        self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        self._last_comment_resp = time.time()
+        deadline = time.time() + 30
+        # 评论区是懒加载且位于视频下方：需要先用页面级滚轮把评论区滚进
+        # 视野，再对列表发真实滚轮，评论接口才会发出。页面组件挂载时机
+        # 有波动，单次触发不可靠，改为每 5 秒重复触发直到有数据（实测验证）
+        last_kick = 0.0
+        while time.time() < deadline and not self.comments:
+            time.sleep(0.5)
+            self._drain_comments()
+            if self.comments:
+                break
+            if time.time() - last_kick >= 5:
+                vp = self._page.viewport_size
+                self._page.mouse.move(vp["width"] / 2, vp["height"] / 2)
+                self._page.mouse.wheel(0, 1200)
+                time.sleep(1.2)
+                if self._scroll_comment_panel():
+                    log("已滚动到评论区并发送滚轮触发...")
+                last_kick = time.time()
+        self._check_captcha()
+        if not self.comments:
+            pause("  没等到评论数据，请在浏览器窗口确认状态（可能要点开评论区）")
+            deadline = time.time() + 10
             while time.time() < deadline and not self.comments:
                 time.sleep(0.5)
                 self._drain_comments()
-                if self.comments:
-                    break
-                if time.time() - last_kick >= 5:
-                    vp = self._page.viewport_size
-                    self._page.mouse.move(vp["width"] / 2, vp["height"] / 2)
-                    self._page.mouse.wheel(0, 1200)
-                    time.sleep(1.2)
-                    if self._scroll_comment_panel():
-                        log("已滚动到评论区并发送滚轮触发...")
-                    last_kick = time.time()
-            self._check_captcha()
-            if not self.comments:
-                pause("  没等到评论数据，请在浏览器窗口确认状态（可能要点开评论区）")
-                deadline = time.time() + 10
-                while time.time() < deadline and not self.comments:
-                    time.sleep(0.5)
-                    self._drain_comments()
-            if not self.comments:
-                log("评论接口没有返回数据（cookies 失效 / 视频无评论 / 页面结构变化），退出")
+        if not self.comments:
+            log("评论接口没有返回数据（cookies 失效 / 视频无评论 / 页面结构变化）")
+            return 0
+
+        # 边抓边写盘：新评论随时追加进临时 CSV，中途崩溃/停止不丢已抓数据；
+        # comments 里已是压缩过的行 dict，直接写，不要再做二次转换
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        tmp_csv = csv_dir / f"{csv_base}_进行中.csv"
+        tmp_csv.unlink(missing_ok=True)   # 清掉上次可能残留的进行中文件
+        written = 0
+
+        def _flush_new():
+            """把新增评论追加写入临时 CSV（表头在文件为空时写入）"""
+            nonlocal written
+            cap = self.limit if self.limit else None
+            new = self.comments[written:cap]
+            if not new:
                 return
+            with open(tmp_csv, "a", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=list(new[0].keys()))
+                if f.tell() == 0:
+                    w.writeheader()
+                w.writerows(new)
+            written += len(new)
 
-            # 边抓边写盘：新评论随时追加进临时 CSV，中途崩溃/停止不丢已抓数据；
-            # comments 里已是压缩过的行 dict，直接写，不要再做二次转换
-            csv_dir = self.outdir / "comments"
-            csv_dir.mkdir(exist_ok=True)
-            tmp_csv = csv_dir / f"评论_{vid}_进行中.csv"
-            tmp_csv.unlink(missing_ok=True)   # 清掉上次可能残留的进行中文件
-            written = 0
+        _flush_new()   # 首批评论先落盘
 
-            def _flush_new():
-                """把新增评论追加写入临时 CSV（表头在文件为空时写入）"""
-                nonlocal written
-                cap = self.limit if self.limit else None
-                new = self.comments[written:cap]
-                if not new:
-                    return
-                with open(tmp_csv, "a", newline="", encoding="utf-8-sig") as f:
-                    w = csv.DictWriter(f, fieldnames=list(new[0].keys()))
-                    if f.tell() == 0:
-                        w.writeheader()
-                    w.writerows(new)
-                written += len(new)
-
-            _flush_new()   # 首批评论先落盘
-
-            # 滚动加载更多
-            last_n, stable = -1, 0
-            while True:
-                self._drain_comments()
-                _flush_new()
-                if self.limit and len(self.comments) >= self.limit:
-                    log(f"已达 --limit {self.limit}，停止收集")
+        # 滚动加载更多
+        last_n, stable = -1, 0
+        while True:
+            self._drain_comments()
+            _flush_new()
+            if self.limit and len(self.comments) >= self.limit:
+                log(f"已达 --limit {self.limit}，停止收集")
+                break
+            if not self.comment_has_more and len(self.comments) == last_n:
+                log("评论区已到末尾")
+                break
+            n = self._scroll_comment_panel()
+            if n == 0:
+                log("页面上找不到可滚动的评论容器，无法加载更多")
+            time.sleep(random.uniform(1.5, 2.5))
+            self._check_captcha()
+            if len(self.comments) == last_n:
+                stable += 1
+                if stable >= 6:
+                    log("连续多轮滚动没有新评论，停止收集")
                     break
-                if not self.comment_has_more and len(self.comments) == last_n:
-                    log("评论区已到末尾")
-                    break
-                n = self._scroll_comment_panel()
-                if n == 0:
-                    log("页面上找不到可滚动的评论容器，无法加载更多")
-                time.sleep(random.uniform(1.5, 2.5))
-                self._check_captcha()
-                if len(self.comments) == last_n:
-                    stable += 1
-                    if stable >= 6:
-                        log("连续多轮滚动没有新评论，停止收集")
-                        break
-                else:
-                    stable = 0
-                    # 每多收集 50 条评论随机歇一会，降低请求密度防风控
-                    if last_n >= 0 and len(self.comments) // 50 > last_n // 50:
-                        rest = random.uniform(4, 8)
-                        log(f"  已收集 {len(self.comments)} 条，歇 {rest:.0f} 秒降低请求密度...")
-                        time.sleep(rest)
-                    log(f"  已收集 {len(self.comments)} 条评论")
-                last_n = len(self.comments)
+            else:
+                stable = 0
+                # 每多收集 50 条评论随机歇一会，降低请求密度防风控
+                if last_n >= 0 and len(self.comments) // 50 > last_n // 50:
+                    rest = random.uniform(4, 8)
+                    log(f"  已收集 {len(self.comments)} 条，歇 {rest:.0f} 秒降低请求密度...")
+                    time.sleep(rest)
+                log(f"  已收集 {len(self.comments)} 条评论")
+            last_n = len(self.comments)
 
-            if self.limit:
-                self.comments = self.comments[:self.limit]
-            rows = sorted(self.comments, key=lambda r: (r["点赞"] or 0), reverse=True)
-            csv_path = csv_dir / f"评论_{vid}_{len(rows)}条.csv"
-            with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-                w.writeheader()
-                w.writerows(rows)
-            tmp_csv.unlink(missing_ok=True)
-            log("=" * 60)
-            log(f"评论抓取完成: 共 {len(rows)} 条（按点赞数排序）")
-            log(f"  保存位置: {csv_path}")
-            log("=" * 60)
-        finally:
-            self.stop_browser()
+        if self.limit:
+            self.comments = self.comments[:self.limit]
+        rows = sorted(self.comments, key=lambda r: (r["点赞"] or 0), reverse=True)
+        csv_path = csv_dir / f"{csv_base}_{len(rows)}条.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        tmp_csv.unlink(missing_ok=True)
+        log(f"评论抓取完成: {len(rows)} 条（按点赞数排序）→ {csv_path.name}")
+        return len(rows)
+
+    def _sorted_vid_list(self, works):
+        """作品 dict -> [(vid, 标题, 发布时间戳)]，按发布时间倒序（与下载顺序一致）"""
+        ws = sorted(works.values(),
+                    key=lambda w: w.get("create_time") or 0, reverse=True)
+        return [(w.get("aweme_id"), (w.get("desc") or "").replace("\n", " "),
+                 w.get("create_time") or 0)
+                for w in ws if w.get("aweme_id")]
+
+    def _comments_phase(self, vid_titles):
+        """集成模式评论采集：对本次涉及的作品逐个抓评论（已有结果的跳过）。
+
+        在视频/图片下载完成后调用；only_comment 切换回调只处理评论接口，
+        作品收集此时已结束，互不干扰。
+        """
+        if not self.with_comments or not vid_titles:
+            return
+        log("=" * 60)
+        log(f"进入评论采集阶段：共 {len(vid_titles)} 个作品"
+            "（已有评论 CSV 的作品自动跳过）")
+        self.only_comment = True
+        self.want_detail = False
+        self.limit = None          # 评论不沿用作品数量限制，全量抓取
+        csv_dir = self.user_dir / "comments"
+        done = skip = fail = 0
+        seen_bases = {}
+        for i, (vid, title, ts) in enumerate(vid_titles, 1):
+            if not vid:
+                continue
+            # 评论文件名与视频文件同款风格（日期_标题），方便人工对应；
+            # 同日同名作品（如每日固定栏目）加视频 id 尾缀避免重名
+            date = datetime.fromtimestamp(ts).strftime("%Y%m%d") if ts else "unknown"
+            csv_base = f"评论_{date}_{safe_name(title)}"
+            if csv_base in seen_bases:
+                csv_base = f"{csv_base}_{vid[-6:]}"
+            seen_bases[csv_base] = vid
+            if list(csv_dir.glob(f"{csv_base}_*条.csv")):
+                skip += 1
+                continue
+            log(f"[{i}/{len(vid_titles)}] 抓取评论: {title[:36]}")
+            try:
+                self._comments_one_video(vid, csv_dir, csv_base)
+                done += 1
+            except Exception as e:
+                fail += 1
+                log(f"  ❌ 评论抓取失败（{type(e).__name__}: {e}），跳过该作品继续")
+            if i < len(vid_titles):
+                rest = random.uniform(3, 6)
+                log(f"  歇 {rest:.0f} 秒降低请求密度...")
+                time.sleep(rest)
+        log(f"评论采集阶段结束：本次抓取 {done} 个，已有跳过 {skip} 个，失败 {fail} 个")
+        log(f"  保存位置: {csv_dir}")
 
 
 # ---------------------------------------------------------------- 命令行入口
@@ -1134,6 +1267,9 @@ def main():
     parser.add_argument("--outdir", default=str(Path(__file__).parent / "downloads"),
                         help="输出目录（默认 脚本目录/downloads）")
     parser.add_argument("--headless", action="store_true", help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
+    parser.add_argument("--with-comments", action="store_true",
+                        help="下载作品后逐个打开视频页抓取评论（导出 CSV），"
+                             "仅对 --account/--url/--video/--search 生效")
     parser.add_argument("--selftest", action="store_true",
                         help="快速自检：依赖/cookies/网络/页面结构是否兼容（不跑任务）")
     args = parser.parse_args()
@@ -1168,7 +1304,8 @@ def main():
     log(f"cookies 解析出 {len(cookies)} 个字段")
 
     spider = DouyinSpider(cookies, args.outdir, headless=args.headless,
-                          limit=args.limit, since=args.since, until=args.until)
+                          limit=args.limit, since=args.since, until=args.until,
+                          with_comments=args.with_comments)
     try:
         if args.search:
             spider.run_search(args.search, sort=args.sort)

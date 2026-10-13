@@ -154,7 +154,8 @@ class Runner:
             }
 
     def start(self, mode, query, cookie_text, limit, since=None, until=None,
-              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None):
+              start_at=None, batch_type=None, outdir=None, sort=None, danmode=None,
+              with_comments=None):
         with self.lock:
             if self.running:
                 return "已有任务在运行，请先停止或等待完成"
@@ -269,6 +270,8 @@ class Runner:
                         c += ["--until", until]
                 if limit_n:
                     c += ["--limit", str(limit_n)]
+                if with_comments in (True, "true", "1", "on") and bt != "comments":
+                    c += ["--with-comments"]
                 cmds.append(c)
             desc = f"批量任务（共 {len(cmds)} 个，依次执行）"
         else:
@@ -288,6 +291,8 @@ class Runner:
                     cmd += ["--until", until]
             if limit_n:
                 cmd += ["--limit", str(limit_n)]
+            if with_comments in (True, "true", "1", "on") and mode != "comments":
+                cmd += ["--with-comments"]
             cmds, desc = [cmd], None
 
         with self.lock:
@@ -731,6 +736,14 @@ PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
+    <div id="commentsRow" style="display:none; margin-top:10px">
+      <label style="display:flex; align-items:center; gap:8px; margin:0">
+        <input type="checkbox" id="withComments" style="width:auto">
+        同时抓取每个作品的评论（导出 CSV，保存在任务目录的 comments 子文件夹；
+        作品下载完成后逐个打开视频页采集，作品较多时耗时明显变长）
+      </label>
+    </div>
+
     <div id="liveRow" style="display:none">
       <label>录制视角</label>
       <select id="danmode">
@@ -823,6 +836,9 @@ function onMode() {
   const showSort = m === "search" || (m === "batch" && $("batchType").value === "search");
   $("sortRow").style.display = showSort ? "flex" : "none";
   $("searchTip").style.display = showSort ? "block" : "none";
+  const showCk = (m === "user" || m === "single" || m === "search"
+                  || (m === "batch" && ["user", "single", "search"].includes($("batchType").value)));
+  $("commentsRow").style.display = showCk ? "block" : "none";
   const isBatch = m === "batch";
   $("queryLabel").style.display = isBatch ? "none" : "block";
   $("query").style.display = isBatch ? "none" : "block";
@@ -870,6 +886,7 @@ async function start() {
     batchType: $("batchType").value,
     outdir: $("outdir").value,
     sort: searchSort,
+    withComments: $("withComments").checked,
     danmode: $("danmode") ? $("danmode").value : "clean"
   });
   if (res.error) { setStatus(res.error, "err"); }
@@ -1010,9 +1027,9 @@ class Handler(BaseHTTPRequestHandler):
             err = runner.start(data.get("mode"), data.get("query"),
                                data.get("cookie"), data.get("limit"),
                                data.get("since"), data.get("until"),
-                               data.get("startat"),
-                               data.get("batchType"), data.get("outdir"),
-                               data.get("sort"), data.get("danmode"))
+                               data.get("startat"), data.get("batchType"),
+                               data.get("outdir"), data.get("sort"),
+                               data.get("danmode"), data.get("withComments"))
             self._send(200, json.dumps({"error": err}, ensure_ascii=False))
         elif self.path == "/login":
             err = runner.start("login", None, None, None)
