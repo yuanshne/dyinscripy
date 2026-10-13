@@ -1087,9 +1087,12 @@ class LiveRecorder:
                     part += 1
                     if self._time_up():
                         break
-                    # 用户要求：流一断就收尾打包，不再找流重连
-                    log("流断开了，直接收尾转封装（按设定不再找流重连）")
-                    break
+                    # 抖音服务端会随机重置拉流连接，无法避免：等几秒后
+                    # 重新打开同一直播间拿新地址，续录成下一个 part；
+                    # 房间真的下播时下一轮取不到流，会判定下播并收尾
+                    log("流断开了，5 秒后尝试同房间续录（下一个 part 文件）...")
+                    time.sleep(5)
+                    self._reopen_room()
                 else:
                     if raw.exists() and raw.stat().st_size < 10240:
                         raw.unlink()
