@@ -40,6 +40,12 @@ except ImportError:
     print("或手动执行: pip install requests playwright && playwright install chromium")
     sys.exit(1)
 
+# exe 模式下 __file__ 指向 _internal，cookies/logs/下载目录要对齐 exe 同级（与 UI 外壳一致）
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
 # 与浏览器保持一致的 UA（下载视频/图片时也要用同一个，降低风控概率）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -81,7 +87,7 @@ INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
                and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
 
 
-_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+_LOG_FILE = BASE_DIR / "logs" / f"{datetime.now():%Y%m%d}.log"
 
 
 def log(msg):
@@ -1216,7 +1222,7 @@ def _selftest():
         return ok
 
     # 2. cookies
-    ck = Path(__file__).parent / "cookies.txt"
+    ck = BASE_DIR / "cookies.txt"
     good = ck.exists() and ck.stat().st_size > 50
     report("cookies 文件", good,
            str(ck) if good else f"缺失（{ck}），先运行 douyin_login.py 登录")
@@ -1264,7 +1270,7 @@ def main():
     parser.add_argument("--limit", type=int, help="只爬前 N 个作品")
     parser.add_argument("--since", help="只爬该日期（含）之后的作品，格式 YYYY-MM-DD")
     parser.add_argument("--until", help="只爬该日期（含）之前的作品，格式 YYYY-MM-DD")
-    parser.add_argument("--outdir", default=str(Path(__file__).parent / "downloads"),
+    parser.add_argument("--outdir", default=str(BASE_DIR / "downloads"),
                         help="输出目录（默认 脚本目录/downloads）")
     parser.add_argument("--headless", action="store_true", help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
     parser.add_argument("--with-comments", action="store_true",
@@ -1297,7 +1303,14 @@ def main():
             print("未输入，退出")
             sys.exit(1)
 
-    cookies = load_cookies(args.cookie, args.cookie_file)
+    # 未显式提供 cookie 时自动找脚本/exe 同目录下的 cookies.txt（与录制器一致）
+    cookie_file = args.cookie_file
+    if not cookie_file and not args.cookie:
+        default_ck = BASE_DIR / "cookies.txt"
+        if default_ck.exists():
+            cookie_file = str(default_ck)
+
+    cookies = load_cookies(args.cookie, cookie_file)
     if not cookies:
         print("cookies 解析结果为空，退出")
         sys.exit(1)

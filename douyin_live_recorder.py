@@ -65,15 +65,21 @@ except ImportError:
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+# exe 模式下 __file__ 指向 _internal，cookies/logs/录像目录要对齐 exe 同级（与 UI 外壳一致）
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
 # 「停止」标记文件：网页界面点「停止」时放置，录制器轮询到后优雅收尾退出
-_STOP_FLAG = Path(__file__).parent / "stop.flag"
+_STOP_FLAG = BASE_DIR / "stop.flag"
 
 # 交互判定：网页外壳（DY_UNATTENDED=1）或 stdin 不可读时按无人值守处理
 INTERACTIVE = (os.environ.get("DY_UNATTENDED") != "1"
                and hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
 
 
-_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+_LOG_FILE = BASE_DIR / "logs" / f"{datetime.now():%Y%m%d}.log"
 
 
 def log(msg):
@@ -210,6 +216,7 @@ def check_disk_free(outdir, min_gb=5.0):
 # 拉流档位键（FULL_HD1=原画 HD1=超清 SD1=高清 SD2=标清），
 # 首选原画，缺失时按列表顺序就近回落
 QUALITY_KEYS = ["FULL_HD1", "HD1", "SD1", "SD2"]
+TIER_NAMES = {"FULL_HD1": "原画", "HD1": "超清", "SD1": "高清", "SD2": "标清"}
 
 
 # ---------- 弹幕接口 protobuf 最小解析（clean_dm 模式） ----------
@@ -451,7 +458,8 @@ class LiveRecorder:
 """
 
     def _stream_from_store(self):
-        """从播放器数据直取所选档位的 flv 地址（缺档就近回落），拿不到返回 None"""
+        """从播放器数据直取最高可用档位的 flv 地址，返回 (档位中文名, 地址)；
+        拿不到返回 None（缺档时按 QUALITY_KEYS 顺序就近回落）"""
         try:
             urls = self._page.evaluate(self._STORE_FLV_JS)
         except Exception:
@@ -461,7 +469,7 @@ class LiveRecorder:
         for key in QUALITY_KEYS:
             u = urls.get(key)
             if u and ".flv?" in u:
-                return u
+                return TIER_NAMES.get(key, key), u
         return None
 
     # ---------- 直播间 ----------
@@ -998,8 +1006,9 @@ class LiveRecorder:
                 # 直接拦截播放器请求会录到低档画面
                 su = self._stream_from_store()
                 if su:
-                    kind, url = "flv", su
-                    log("已从播放器数据直取最高画质（原画）拉流地址")
+                    tier, su_url = su
+                    kind, url = "flv", su_url
+                    log(f"已从播放器数据直取最高画质（{tier}）拉流地址")
                 else:
                     kind, url = self.wait_for_stream(20)
 
@@ -1148,7 +1157,7 @@ def _selftest():
            "" if has_ffmpeg() else "未找到（重跑「打开爬虫界面.bat」自动安装）")
 
     # 2. cookies
-    ck = Path(__file__).parent / "cookies.txt"
+    ck = BASE_DIR / "cookies.txt"
     good = ck.exists() and ck.stat().st_size > 50
     report("cookies 文件", good,
            str(ck) if good else f"缺失（{ck}），未登录也能录大部分直播，但部分直播间受限")
@@ -1176,7 +1185,7 @@ def main():
     parser.add_argument("--minutes", type=int, default=0,
                         help="录多少分钟（默认 0 = 不限，Ctrl+C 停止）")
     parser.add_argument("--start", help="定时开始，如 20:00 或 2026-10-11 20:00（默认立即开始）")
-    parser.add_argument("--outdir", default=str(Path(__file__).parent / "downloads" / "live"),
+    parser.add_argument("--outdir", default=str(BASE_DIR / "downloads" / "live"),
                         help="输出目录（默认 脚本目录/downloads/live）")
     parser.add_argument("--headless", action="store_true",
                         help="无头模式（不弹浏览器窗口，出验证时无法手动处理，不建议）")
@@ -1231,7 +1240,7 @@ def main():
 
     cookie_file = args.cookie_file
     if not cookie_file and not args.cookie:
-        default = Path(__file__).parent / "cookies.txt"
+        default = BASE_DIR / "cookies.txt"
         if default.exists():
             cookie_file = str(default)
 
