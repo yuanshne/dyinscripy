@@ -350,12 +350,16 @@ class DouyinSpider:
             if data.get("comments"):
                 self._last_comment_resp = time.time()
             for c in data.get("comments") or []:
-                cid = c.get("cid")
-                if cid and cid not in self._comment_seen:
-                    self._comment_seen.add(cid)
-                    # 采集时就压缩成 CSV 所需字段：原始评论 dict 含用户资料等，
-                    # 每条几 KB，几万条评论会累积上百 MB 内存
-                    self.comments.append(self.summarize_comment(c))
+                # 顶级评论响应里还内嵌回复预览（reply_comment 字段，
+                # 展开前页面自动带出的前几条回复），一并收集，
+                # 剩余未带出的回复由 _expand_reply_phase 点击展开后并入
+                for item in [c] + (c.get("reply_comment") or []):
+                    cid = item.get("cid")
+                    if cid and cid not in self._comment_seen:
+                        self._comment_seen.add(cid)
+                        # 采集时就压缩成 CSV 所需字段：原始评论 dict 含用户
+                        # 资料等，每条几 KB，几万条评论会累积上百 MB 内存
+                        self.comments.append(self.summarize_comment(item))
             if data.get("has_more") in (0, False, "0"):
                 self.comment_has_more = False
 
@@ -1003,8 +1007,10 @@ class DouyinSpider:
     def summarize_comment(c):
         u = c.get("user") or {}
         ct = c.get("create_time")
+        rid = c.get("reply_id")
         return {
             "cid": c.get("cid"),
+            "类型": "回复" if rid and str(rid) != "0" else "评论",
             "评论内容": (c.get("text") or "").replace("\r", " ").replace("\n", " "),
             "昵称": u.get("nickname") or "",
             "抖音号": u.get("unique_id") or u.get("short_id") or "",
@@ -1015,6 +1021,137 @@ class DouyinSpider:
             "回复数": c.get("reply_comment_total"),
             "评论时间": datetime.fromtimestamp(ct).strftime("%Y-%m-%d %H:%M:%S") if ct else "",
         }
+
+    def _expand_reply_phase(self):
+        """顶级评论抓完后，逐个点击「展开N条回复」加载子回复。
+
+        回复接口 /comment/list/reply/ 的 URL 含顶级评论接口前缀，
+        会被同一个响应拦截器收进队列，由 _drain_comments 统一解析去重，
+        无需另写回复解析逻辑。
+        注意：评论列表是虚拟渲染，只有滚进视野的条目挂在 DOM 上；顶级
+        翻页结束后视口停在列表底部，此时 DOM 里只有末尾几条的展开控件。
+        必须自底向上逐屏回滚，把沿途出现的展开控件逐个点掉，回滚到顶
+        且滚不动了才结束。
+        """
+        log("开始展开子回复...")
+        stall = 0
+        last_top = -1
+        for _ in range(800):   # 点击+滚屏总步数硬上限，防异常 DOM 死循环
+            if self.limit and len(self.comments) >= self.limit:
+                return
+            pos = self._page.evaluate("""() => {
+                const list = document.querySelector('[data-e2e="comment-list"]');
+                if (!list) return null;
+                const els = [...list.querySelectorAll('div,span')]
+                    .filter(e => !e.children.length &&
+                                 /^展开\\s*\\d*\\s*条?回复/.test(e.textContent.trim()));
+                if (!els.length) return null;
+                // 即时滚动：容器是 smooth 滚动时默认 scrollIntoView 会让
+                // 元素持续移动，随后读到的坐标是过期的，点击会落空
+                els[0].scrollIntoView({block: 'center', behavior: 'instant'});
+                const r = els[0].getBoundingClientRect();
+                return {x: r.x + r.width / 2, y: r.y + r.height / 2};
+            }""")
+            if not pos:
+                # 当前视野没有展开控件：向上滚一屏，让上一段评论进 DOM
+                sc = self._page.evaluate("""() => {
+                    const list = document.querySelector('[data-e2e="comment-list"]');
+                    if (!list) return null;
+                    const box = list.closest('[class*="route-scroll-container"]')
+                                || document.scrollingElement;
+                    const r = list.getBoundingClientRect();
+                    return {top: box.scrollTop,
+                            x: r.x + r.width / 2,
+                            y: Math.max(60, Math.min(r.y + r.height / 2,
+                                                     window.innerHeight - 60))};
+                }""")
+                if not sc or sc["top"] <= 2 or sc["top"] == last_top:
+                    log(f"子回复展开完成，共收集 {len(self.comments)} 条")
+                    return
+                last_top = sc["top"]
+                self._page.mouse.move(sc["x"], sc["y"])
+                self._page.mouse.wheel(0, -900)
+                time.sleep(random.uniform(0.8, 1.2))
+                continue
+            n0 = len(self.comments)
+            try:
+                self._page.mouse.move(pos["x"], pos["y"])
+                self._page.mouse.click(pos["x"], pos["y"])
+            except Exception as e:
+                log(f"点击展开回复失败（{type(e).__name__}），跳过剩余回复")
+                return
+            # 等回复响应进来；还在持续增长就延长等待（大线程分多页拉取）
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                time.sleep(0.3)
+                self._drain_comments()
+                if len(self.comments) > n0:
+                    n0 = len(self.comments)
+                    deadline = time.time() + 2
+            self._check_captcha()
+            stall = 0 if len(self.comments) > n0 else stall + 1
+            if stall >= 8:
+                log("连续多次展开没有新回复响应，停止展开")
+                return
+
+    def _reply_sweep_phase(self):
+        """展开后把评论列表再从头到尾滚一遍，补拉大回复线程的剩余回复。
+
+        大线程（如几十条回复）展开时页面只自动拉前几页，剩余回复要等
+        线程内容滚进视野才继续请求；用顶级评论的回复数合计作为目标数，
+        缺口还在且滚动仍有增长时多滚几遍，最多 3 遍。
+        """
+        def _reply_gap():
+            top_n = sum(r["回复数"] or 0 for r in self.comments if r["类型"] == "评论")
+            got_n = sum(1 for r in self.comments if r["类型"] == "回复")
+            return top_n - got_n
+
+        for sweep in range(3):
+            gap = _reply_gap()
+            if gap <= 0:
+                return
+            log(f"回复缺口 {gap} 条，第 {sweep + 1}/3 遍滚动补拉...")
+            n0 = len(self.comments)
+            ok = self._page.evaluate("""() => {
+                const list = document.querySelector('[data-e2e="comment-list"]');
+                if (!list) return false;
+                const box = list.closest('[class*="route-scroll-container"]')
+                            || document.scrollingElement;
+                box.scrollTop = 0;
+                return true;
+            }""")
+            if not ok:
+                return
+            time.sleep(1.0)
+            idle = 0
+            last_top = -1
+            for _ in range(200):
+                self._drain_comments()
+                vp = self._page.viewport_size
+                self._page.mouse.move(vp["width"] / 2, vp["height"] / 2)
+                self._page.mouse.wheel(0, 700)
+                time.sleep(random.uniform(0.8, 1.1))
+                self._drain_comments()
+                top = self._page.evaluate("""() => {
+                    const list = document.querySelector('[data-e2e="comment-list"]');
+                    if (!list) return -1;
+                    const box = list.closest('[class*="route-scroll-container"]')
+                                || document.scrollingElement;
+                    return box.scrollTop;
+                }""")
+                if _reply_gap() <= 0:
+                    return
+                if top == last_top or top <= 2:
+                    idle += 1
+                    if idle >= 3:
+                        break   # 已滚到列表末尾
+                else:
+                    idle = 0
+                last_top = top
+            if len(self.comments) == n0:
+                log("本轮滚动没有补到新回复，停止补拉")
+                return
+        log(f"补拉结束（回复缺口 {_reply_gap()} 条，多为平台已过滤内容）")
 
     def run_comments(self, query):
         """独立评论模式：只抓单个视频的评论，不下载作品"""
@@ -1132,6 +1269,13 @@ class DouyinSpider:
                     time.sleep(rest)
                 log(f"  已收集 {len(self.comments)} 条评论")
             last_n = len(self.comments)
+
+        # 顶级评论抓完后展开子回复（回复响应复用同一拦截器，cid 去重后并入）
+        if not (self.limit and len(self.comments) >= self.limit):
+            self._expand_reply_phase()
+            _flush_new()
+            self._reply_sweep_phase()
+            _flush_new()
 
         if self.limit:
             self.comments = self.comments[:self.limit]
