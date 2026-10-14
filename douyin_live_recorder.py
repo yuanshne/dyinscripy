@@ -1026,21 +1026,22 @@ class LiveRecorder:
                     if self._finished:
                         log("已录到的流中断后未能恢复，判定主播已下播，结束录制并收尾")
                         break
-                    if self._looks_not_live():
-                        log("主播当前没在直播。脚本会一直等，每 60 秒刷新检查，开播后自动开始录"
-                            + ("（不想等就 Ctrl+C 退出）" if INTERACTIVE
-                               else "（可在网页界面点「停止」结束）"))
-                        wait_until = time.time() + 60
-                        while time.time() < wait_until and not self._time_up():
-                            self._poll_stop()
-                            time.sleep(2)
-                        self._reopen_room()
-                        continue
-                    log("页面里既没拦到直播流，也挖不到拉流地址"
-                        "（可能未开播 / 弹了验证 / 直播间结构变化）")
-                    self._check_captcha()
-                    pause("  请看一眼浏览器窗口确认状态，按回车重试...")
-                    fails += 1
+                    # 没拿到流且无已录数据 = 没开播/页面未就绪/弹了验证，三者
+                    # 无法可靠区分，统一按"等待开播"处理：每 60 秒重新打开
+                    # 直播间再取（刷新可自愈临时加载失败与验证弹窗）。
+                    # 旧逻辑靠页面文案关键词判断，关键词没命中就 3 次后退出，
+                    # 导致"没开播一直等"实际会中途退出
+                    self._check_captcha()   # 有验证时提示（无人值守下仅记日志）
+                    why = ("主播当前没在直播" if self._looks_not_live()
+                           else "没拿到直播流（页面未就绪 / 弹了验证 / 直播间结构变化）")
+                    log(f"{why}，按未开播处理：每 60 秒刷新等待，开播后自动开始录"
+                        + ("（不想等就 Ctrl+C 退出）" if INTERACTIVE
+                           else "（可在网页界面点「停止」结束）"))
+                    wait_until = time.time() + 60
+                    while time.time() < wait_until and not self._time_up():
+                        self._poll_stop()
+                        time.sleep(2)
+                    self._reopen_room()
                     continue
 
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1096,7 +1097,10 @@ class LiveRecorder:
                 else:
                     if raw.exists() and raw.stat().st_size < 10240:
                         raw.unlink()
-                    if self._finished:
+                    # 只有"此前已录到有效片段"才算下播；当前失败段在录制前就
+                    # 已登记进 _finished，直接判断它会把首个片段失败（如一次
+                    # 502）误判成"直播已结束"直接退出
+                    if any(f.exists() for f in self._finished):
                         log("本段没有录到有效数据，判定直播已结束，收尾转封装")
                         break
                     fails += 1
