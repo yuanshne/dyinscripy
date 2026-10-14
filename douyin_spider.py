@@ -548,6 +548,7 @@ class DouyinSpider:
         log("❗ 检测到验证页面！请在弹出的浏览器窗口里手动完成验证")
         try:
             input("  完成后回到这里按回车继续...")
+            return True
         except (EOFError, OSError):
             # 有 tty 却读不到输入（后台任务/管道环境）：在浏览器窗口里等人工处理，
             # 期间轮询验证是否已解除，最多 5 分钟
@@ -558,10 +559,12 @@ class DouyinSpider:
                     still = self._page.evaluate(_CAPTCHA_JS)
                     if not (still and (still.get("textHit") or still.get("elHit"))):
                         log("验证已解除，继续")
-                        return
+                        return True
                 except Exception:
-                    return
+                    return True
             log("⚠️ 验证长时间未解除，继续尝试（数据可能不全）")
+            return True
+        return False
 
     def collect_works(self):
         total_hint = (self.profile or {}).get("aweme_count")
@@ -901,6 +904,61 @@ class DouyinSpider:
 
     # ---------- 关键词搜索模式 ----------
 
+    def _warmup_home(self, seconds=3.0):
+        """首页停留+自然滚动，模拟真人浏览轨迹，降低搜索触发风控概率。
+        新会话第一步就直跳搜索页是最典型的机器人特征（run_search 旧实现），
+        与 locate_user 里已验证有效的预热逻辑保持一致。"""
+        log("首页预热（模拟真人浏览，降低搜索风控概率）...")
+        try:
+            self._page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
+                            timeout=60000)
+        except Exception:
+            return
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            self._page.mouse.move(random.randint(300, 1200), random.randint(200, 700))
+            self._page.mouse.wheel(0, random.randint(400, 1200))
+            time.sleep(random.uniform(0.8, 1.6))
+
+    def _human_search(self, query):
+        """真人式搜索路径：点搜索框 -> 输入关键词 -> 回车 -> 等结果页，
+        替代旧的直跳 /search/关键词 URL（带 Referer 与会话轨迹，风控分更低）。"""
+        box = None
+        try:
+            box = self._page.wait_for_selector(
+                'input[placeholder*="搜索"], [contenteditable="true"]',
+                timeout=8000)
+        except Exception:
+            box = None
+        if box is None:
+            # 搜索框找不到就退回直跳（总比卡死强）
+            log("没定位到搜索框，退回直接打开搜索页")
+            self._page.goto(f"https://www.douyin.com/search/{quote(query)}?type=video",
+                            wait_until="domcontentloaded", timeout=60000)
+            return
+        try:
+            box.click()
+            time.sleep(random.uniform(0.5, 1.0))
+            self._page.keyboard.type(query, delay=random.uniform(80, 180))
+            time.sleep(random.uniform(0.6, 1.2))
+            self._page.keyboard.press("Enter")
+        except Exception:
+            log("搜索框交互失败，退回直接打开搜索页")
+            self._page.goto(f"https://www.douyin.com/search/{quote(query)}?type=video",
+                            wait_until="domcontentloaded", timeout=60000)
+            return
+        time.sleep(random.uniform(3.0, 5.0))
+        # 从综合结果页点「视频」标签（等价旧 URL 的 type=video）
+        try:
+            tab = self._page.wait_for_selector(
+                'div:has(> span:text-is("视频")), a[href*="type=video"]',
+                timeout=5000)
+            if tab:
+                tab.click()
+                time.sleep(random.uniform(2.0, 3.0))
+        except Exception:
+            pass
+
     def run_search(self, query, sort="general"):
         """关键词搜索模式。
 
@@ -916,15 +974,22 @@ class DouyinSpider:
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.start_browser()
         try:
-            # 综合排序=0，点赞最多=2（页面请求回显验证过）
-            st = "2" if sort == "most_like" else "0"
-            sort_name = "点赞最多" if sort == "most_like" else "综合排序"
-            url = (f"https://www.douyin.com/search/{quote(query)}"
-                   f"?type=video&sort_type={st}")
-            log(f"打开搜索页（排序：{sort_name}）: {url}")
             log("搜索模式：若浏览器里弹出安全验证，请手动完成，"
                 "脚本检测到验证解除后会自动继续")
+            # 先首页预热再走真人式搜索路径（点搜索框输入回车），
+            # 新会话直跳搜索页是最典型的机器人特征，风控概率显著更高
+            self._warmup_home()
+            self._human_search(query)
+            # 真人路径会落到精选页（type=general），且页面结构与
+            # 视频搜索页不同、结果接口拦不稳；此处会话轨迹已建立，
+            # 再归一到标准视频搜索 URL（排序参数页面会回显验证过）
+            st = "2" if sort == "most_like" else "0"
+            url = (f"https://www.douyin.com/search/{quote(query)}"
+                   f"?type=video&sort_type={st}")
+            log(f"归一到视频搜索页（排序：{'点赞最多' if sort == 'most_like' else '综合排序'}）")
             self._page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(random.uniform(3.0, 5.0))
+            log(f"搜索就绪: {self._page.url}")
 
             self.user_dir = self.outdir / f"搜索_{safe_name(query, 30)}"
             self.videos_dir = self.user_dir / "videos"
@@ -939,25 +1004,28 @@ class DouyinSpider:
                 if self.limit and len(self.works) >= self.limit:
                     log(f"已达 --limit {self.limit}，停止收集")
                     break
-                self._check_captcha()
+                if self._check_captcha():
+                    # 验证刚解除：直接高频滚动会二次触发，先回首页预热冷却
+                    self._warmup_home(seconds=10.0)
+                    self._human_search(query)
                 n = len(self.works)
                 if n == last_n:
                     stable += 1
-                    if stable >= 8:  # 连续约 16 秒无新数据：加载完了
+                    if stable >= 12:  # 连续约 36 秒无新数据：加载完了
                         break
                 else:
                     stable = 0
-                    # 每多收集 10 个作品随机歇一会，降低请求密度防风控
+                    # 搜索页比主页风控更严：每多收集 10 个歇 15~30 秒
                     if n // 10 > last_n // 10:
-                        rest = random.uniform(5, 10)
+                        rest = random.uniform(15, 30)
                         log(f"  已收集 {n} 个，歇 {rest:.0f} 秒降低请求密度...")
                         time.sleep(rest)
                     last_n = n
                     log(f"已收集 {n} 个搜索结果...")
-                # 真实鼠标滚轮滚动加载更多（与探测脚本同款，实测有效）
-                self._page.mouse.move(800, 450)
-                self._page.mouse.wheel(0, random.uniform(900, 1600))
-                time.sleep(random.uniform(1.5, 2.5))
+                # 真实鼠标滚轮滚动加载更多；搜索页降速（3~5 秒/次）
+                self._page.mouse.move(random.randint(500, 1100), random.randint(300, 600))
+                self._page.mouse.wheel(0, random.uniform(700, 1400))
+                time.sleep(random.uniform(3.0, 5.0))
 
             if not self.works:
                 log("搜索结果一条都没收到。可能：验证未完成 / cookies 失效 / 关键词无结果")
