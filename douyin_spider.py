@@ -92,7 +92,13 @@ _LOG_FILE = BASE_DIR / "logs" / f"{datetime.now():%Y%m%d}.log"
 
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        # Windows PowerShell / older terminals may use GBK, which cannot
+        # represent the status icons used by selftest output.
+        print(line.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8"), flush=True)
     # 同时落盘到 logs/日期.log，事后可查（界面内存日志关掉就没了）
     try:
         _LOG_FILE.parent.mkdir(exist_ok=True)
@@ -128,6 +134,42 @@ def _best_video_url(video):
         return None
     best = max(rates, key=lambda br: br.get("bit_rate") or 0)
     return best["play_addr"]["url_list"][0]
+
+
+def _slim_aweme(aw):
+    """只保留下载/写元数据/去重真正用到的字段。
+
+    接口返回的 aweme JSON 每条约十几到几十 KB（music、text_extra、
+    bit_rate 全档位地址等），大批量采集时全部常驻内存会把占用推高很多。
+    裁剪后单条约 1~3KB，且最高码率档在入库时就算好、只留选中那一档，
+    后续 _best_video_url / build_tasks / summarize_work 行为不变。
+    """
+    video = aw.get("video") or {}
+    rates = [br for br in (video.get("bit_rate") or [])
+             if (br.get("play_addr") or {}).get("url_list")]
+    best = max(rates, key=lambda br: br.get("bit_rate") or 0) if rates else None
+    return {
+        "aweme_id": aw.get("aweme_id"),
+        "desc": aw.get("desc"),
+        "create_time": aw.get("create_time"),
+        "is_top": aw.get("is_top"),
+        "statistics": {k: (aw.get("statistics") or {}).get(k)
+                       for k in ("digg_count", "comment_count",
+                                 "collect_count", "share_count")},
+        "author": {k: (aw.get("author") or {}).get(k)
+                   for k in ("sec_uid", "unique_id", "nickname")},
+        "images": [{"url_list": (img or {}).get("url_list") or []}
+                   for img in (aw.get("images") or [])],
+        "video": {
+            "play_addr": {"url_list": (video.get("play_addr") or {})
+                          .get("url_list") or []},
+            "download_addr": {"url_list": (video.get("download_addr") or {})
+                              .get("url_list") or []},
+            "bit_rate": ([{"bit_rate": best.get("bit_rate"),
+                           "play_addr": {"url_list": best["play_addr"]["url_list"]}}]
+                         if best else []),
+        },
+    }
 
 
 def parse_cookie_string(raw):
@@ -294,7 +336,7 @@ class DouyinSpider:
                         au = (aw.get("author") or {}).get("sec_uid")
                         if self.target_sec and au and au != self.target_sec:
                             continue
-                        self.works[awid] = aw
+                        self.works[awid] = _slim_aweme(aw)
                         new_cnt += 1
                 if data.get("has_more") in (0, False, "0", None):
                     if new_cnt == 0:
@@ -310,7 +352,7 @@ class DouyinSpider:
                 if self.expect_vid is None:
                     return
                 if aw.get("aweme_id") == self.expect_vid:
-                    self.works[aw["aweme_id"]] = aw
+                    self.works[aw["aweme_id"]] = _slim_aweme(aw)
                     self.has_more = False
                     self._last_post_resp = time.time()
             elif API_SEARCH in url:
@@ -323,7 +365,7 @@ class DouyinSpider:
                     awid = aw.get("aweme_id")
                     if (awid and awid not in self.works
                             and (aw.get("video") or {}).get("play_addr", {}).get("url_list")):
-                        self.works[awid] = aw
+                        self.works[awid] = _slim_aweme(aw)
                         new_cnt += 1
                 if new_cnt:
                     self._last_post_resp = time.time()
@@ -704,7 +746,8 @@ class DouyinSpider:
                 if status == "fail" and t.get("fallback") and t["fallback"] != t["url"]:
                     status, size = self._download_one(t["fallback"], t["path"], session)
                 done += 1
-                mark = {"ok": "✓", "skip": "已存在", "fail": "✗"}.get(status, status)
+                # Keep direct progress output compatible with legacy GBK consoles.
+                mark = {"ok": "[OK]", "skip": "[SKIP]", "fail": "[FAIL]"}.get(status, status)
                 print(f"  [{done}/{len(dl)}] {mark} {t['path'].name} "
                       f"({size/1024/1024:.2f} MB)", flush=True)
         return session
@@ -1141,7 +1184,8 @@ class DouyinSpider:
                 self._page.mouse.wheel(0, -900)
                 time.sleep(random.uniform(0.8, 1.2))
                 continue
-            n0 = len(self.comments)
+            before = len(self.comments)
+            n0 = before
             try:
                 self._page.mouse.move(pos["x"], pos["y"])
                 self._page.mouse.click(pos["x"], pos["y"])
@@ -1157,7 +1201,9 @@ class DouyinSpider:
                     n0 = len(self.comments)
                     deadline = time.time() + 2
             self._check_captcha()
-            stall = 0 if len(self.comments) > n0 else stall + 1
+            # 用点击前的快照判断本轮是否真有增长；n0 在循环里被刷新，
+            # 拿它比较会恒为假，导致每点一次就误判失败、8 次后提前收工
+            stall = 0 if len(self.comments) > before else stall + 1
             if stall >= 8:
                 log("连续多次展开没有新回复响应，停止展开")
                 return

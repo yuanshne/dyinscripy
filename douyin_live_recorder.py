@@ -84,7 +84,13 @@ _LOG_FILE = BASE_DIR / "logs" / f"{datetime.now():%Y%m%d}.log"
 
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        # Windows PowerShell / older terminals may use GBK, which cannot
+        # represent the status icons used by selftest output.
+        print(line.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8"), flush=True)
     # 同时落盘到 logs/日期.log，事后可查（界面内存日志关掉就没了）
     try:
         _LOG_FILE.parent.mkdir(exist_ok=True)
@@ -338,6 +344,7 @@ class LiveRecorder:
         self._browser = None
         self._context = None
         self._page = None
+        self._http = None             # 轻量开播探测的 requests 会话（不开浏览器）
 
         # clean_dm 模式：弹幕接口采集（(本地接收时刻, 服务端时刻, 昵称, 内容) 列表）
         self._danmaku = []
@@ -480,6 +487,91 @@ class LiveRecorder:
         q = query.strip()
         return bool(re.search(r"live\.douyin\.com/(?:\d+|live_web_rid=\d+)", q)
                     or re.fullmatch(r"\d{5,}", q))
+
+    @staticmethod
+    def _direct_room_id(query):
+        """从直接直播间输入里取出纯房间号（_is_direct_room 已保证格式）"""
+        q = query.strip()
+        m = (re.search(r"live\.douyin\.com/(\d+)", q)
+             or re.search(r"live_web_rid=(\d+)", q))
+        return m.group(1) if m else q
+
+    # ---------- 轻量开播探测 ----------
+    #
+    # 等开播期间不必一直开着一个完整 Chromium（实测 1.3GB）：webcast
+    # enter 接口一次响应约 1KB，status=2 直播中 / 4 未开播，用 requests
+    # 轮询即可，内存降到几十 MB。接口异常（风控、改版、网络故障）一律
+    # 返回 None，连续 3 次拿不到结果就退回浏览器探测，避免接口失效后
+    # 永远等不到开播。
+
+    def _probe_live_http(self, room_id):
+        """返回 True=直播中 / False=未开播 / None=探测失败"""
+        try:
+            if self._http is None:
+                self._http = requests.Session()
+            headers = {"User-Agent": UA,
+                       "Referer": f"https://live.douyin.com/{room_id}"}
+            if self.cookies:
+                headers["Cookie"] = "; ".join(
+                    f"{k}={v}" for k, v in self.cookies.items())
+            r = self._http.get(
+                "https://live.douyin.com/webcast/room/web/enter/",
+                headers=headers,
+                params={
+                    "aid": "6383", "app_name": "douyin_web", "live_id": "1",
+                    "device_platform": "web", "language": "zh-CN",
+                    "enter_from": "web_live", "cookie_enabled": "true",
+                    "screen_width": "1920", "screen_height": "1080",
+                    "browser_language": "zh-CN", "browser_platform": "Win32",
+                    "browser_name": "Chrome", "browser_version": "131.0.0.0",
+                    "web_rid": room_id,
+                },
+                timeout=10)
+            data = r.json()
+        except Exception:
+            return None
+        if data.get("status_code") != 0:
+            return None
+        rooms = (data.get("data") or {}).get("data") or []
+        if not rooms:
+            return None
+        status = rooms[0].get("status")
+        if status == 2:
+            return True
+        if status == 4:
+            return False          # 已下播 / 未开播
+        return None
+
+    def _wait_live_http(self, room_id):
+        """未开播时轻量轮询，直到确认开播或接口失效退回浏览器探测。
+
+        被用户停止时由 _poll_stop 抛 KeyboardInterrupt（复用统一退出路径）。
+        """
+        miss = 0
+        while True:
+            self._poll_stop()
+            live = self._probe_live_http(room_id)
+            if live is True:
+                log("检测到主播已开播，启动浏览器开始录制")
+                return True
+            if live is None:
+                miss += 1
+                log(f"开播探测接口无响应（{miss}/3），"
+                    + ("改用浏览器探测" if miss >= 3 else "稍后重试"))
+                if miss >= 3:
+                    return True
+                wait = 15
+            else:
+                miss = 0
+                log(f"主播当前没在直播（房间 {room_id}），"
+                    "每 60 秒轻量探测一次，开播后自动开始录"
+                    + ("（不想等就 Ctrl+C 退出）" if INTERACTIVE
+                       else "（可在网页界面点「停止」结束）"))
+                wait = 60
+            wait_until = time.time() + wait
+            while time.time() < wait_until:
+                self._poll_stop()
+                time.sleep(2)
 
     @staticmethod
     def _extract_url(query):
@@ -989,9 +1081,19 @@ class LiveRecorder:
         # duration 从真正拿到流、开始录制那一刻才起算（启动浏览器/等开播不占时长）
         self.t_start = None
 
+        direct = self._is_direct_room(query)
+        if direct:
+            # 直接给房间号/直播间链接：先用轻量接口等开播，没开播不启动
+            # 浏览器（否则等待期间一个 Chromium 常驻约 1.3GB）。
+            # 该接口需要 cookie（未登录返回空响应），没有就直接走浏览器。
+            if self.cookies:
+                self._wait_live_http(self._direct_room_id(query))
+            else:
+                log("未提供 cookies，轻量开播探测不可用，改用浏览器等待开播")
+
         self.start_browser()
         try:
-            if self._is_direct_room(query):
+            if direct:
                 room_id = self.open_room(query)
             else:
                 # 主页链接/分享文案：先等开播，解析出直播间再录
@@ -1023,7 +1125,10 @@ class LiveRecorder:
                             f"选用最高画质档（{tag}）")
 
                 if not url:
-                    if self._finished:
+                    # _finished 在录制开始前就登记，失败段（文件 <10KB）会被
+                    # 删除但仍留在列表里；必须检查文件真实存在，否则首个
+                    # 片段失败后遇到一次取不到流就会被误判成主播已下播
+                    if any(f.exists() for f in self._finished):
                         log("已录到的流中断后未能恢复，判定主播已下播，结束录制并收尾")
                         break
                     # 没拿到流且无已录数据 = 没开播/页面未就绪/弹了验证，三者

@@ -8,6 +8,9 @@
   登录成功后脚本自动检测到并保存 Cookie，之后爬虫/直播录制就能直接用，
   全程不需要手动复制粘贴任何东西。
 
+登录状态会持久化保存在本目录的 browser_profile 里：扫一次码后，以后再运行
+本脚本会直接复用已登录状态（并顺带刷新 cookies.txt），不用重复扫码。
+
 用法：
   python douyin_login.py                  # 保存到脚本目录的 cookies.txt
   python douyin_login.py --out 我的.txt    # 保存到指定文件
@@ -44,12 +47,25 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
-_LOG_FILE = Path(__file__).parent / "logs" / f"{datetime.now():%Y%m%d}.log"
+# exe 模式下 __file__ 指向 _internal，日志/配置目录要对齐 exe 同级（与其他脚本一致）
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
+# 持久化浏览器配置目录：登录态存在这里，扫一次码后长期复用
+PROFILE_DIR = BASE_DIR / "browser_profile"
+
+_LOG_FILE = BASE_DIR / "logs" / f"{datetime.now():%Y%m%d}.log"
 
 
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode(sys.stdout.encoding or "utf-8", errors="replace").decode(
+            sys.stdout.encoding or "utf-8"), flush=True)
     try:
         _LOG_FILE.parent.mkdir(exist_ok=True)
         with open(_LOG_FILE, "a", encoding="utf-8") as fh:
@@ -65,30 +81,78 @@ def cookies_ready(names):
     return has_login, has_anti
 
 
+def seed_profile(ctx, cookie_file):
+    """首次启用持久化配置时，把已有 cookies.txt 导入 profile，免去重新扫码。
+
+    旧版登录助手生成的 cookies.txt 往往还没过期，直接导入可省一次扫码；
+    导入失败不报错，退回正常扫码流程。
+    """
+    try:
+        text = cookie_file.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    cookies = []
+    for chunk in text.replace("\n", ";").split(";"):
+        chunk = chunk.strip()
+        if not chunk or chunk.startswith("#") or "=" not in chunk:
+            continue
+        name, value = chunk.split("=", 1)
+        if not name.strip() or not value.strip():
+            continue
+        cookies.append({
+            "name": name.strip(),
+            "value": value.strip(),
+            "domain": ".douyin.com",
+            "path": "/",
+            # 不写过期时间会变成会话 Cookie（关浏览器即丢），这里给 30 天
+            "expires": time.time() + 30 * 86400,
+            "secure": True,
+        })
+    if not cookies:
+        return 0
+    try:
+        ctx.add_cookies(cookies)
+        return len(cookies)
+    except Exception:
+        return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="抖音登录助手：扫码登录并自动保存 Cookie")
     ap.add_argument("--out", default=None, help="Cookie 保存路径（默认：脚本目录 cookies.txt）")
     ap.add_argument("--timeout", type=int, default=300, help="等待登录的最长秒数（默认 300）")
     args = ap.parse_args()
 
-    out_path = Path(args.out) if args.out else Path(__file__).parent / "cookies.txt"
+    out_path = Path(args.out) if args.out else BASE_DIR / "cookies.txt"
     out_path = out_path.resolve()
 
+    first_run = not PROFILE_DIR.exists()
     log("正在打开浏览器，请稍候...")
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx = browser.new_context(
-            user_agent=UA,
-            viewport={"width": 1280, "height": 860},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-        )
+        try:
+            # 持久化配置：登录态写在 browser_profile 里，下次直接复用
+            ctx = pw.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR),
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled"],
+                user_agent=UA,
+                viewport={"width": 1280, "height": 860},
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+            )
+        except Exception as e:
+            log(f"浏览器启动失败：{e}")
+            log("如果提示配置目录被占用，请先关掉上次遗留的登录浏览器窗口再重试。")
+            wait_enter()
+            sys.exit(1)
         ctx.add_init_script(
             "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
-        page = ctx.new_page()
+        if first_run:
+            # 旧版生成的 cookies.txt 若仍有效，直接导入，省掉一次扫码
+            n = seed_profile(ctx, BASE_DIR / "cookies.txt")
+            if n:
+                log(f"已导入现有 cookies.txt 的 {n} 个字段到本地登录配置，无需重新扫码")
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto("https://www.douyin.com/", wait_until="domcontentloaded",
                   timeout=60000)
 
@@ -113,7 +177,7 @@ def main():
                 break
             # 浏览器被用户直接关掉就视为放弃
             try:
-                if not browser.is_connected():
+                if not ctx.pages:
                     break
                 page.evaluate("1")   # 探测页面还活着
             except Exception:
@@ -123,7 +187,7 @@ def main():
         if not cookie_list:
             log("未能获取 Cookie（超时未登录，或浏览器被提前关闭），没有改动任何文件。")
             try:
-                browser.close()
+                ctx.close()
             except Exception:
                 pass
             wait_enter()
@@ -147,7 +211,7 @@ def main():
         log("搞定！回到网页界面就能正常使用了（cookie 一栏留空即可）。")
 
         try:
-            browser.close()
+            ctx.close()
         except Exception:
             pass
 

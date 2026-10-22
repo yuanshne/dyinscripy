@@ -9,7 +9,7 @@
 | 模块 | 说明 |
 |---|---|
 | 作品/评论采集 | 按抖音号、主页链接或关键词搜索，抓取作品元数据（CSV）并下载原图（自动选最高码率档）；评论（含子回复，自动展开回复线程）可导出按点赞排序的 CSV，采集过程边抓边落盘，中断不丢已抓数据 |
-| 直播录制 | 纯净模式：直取原画拉流地址，录制画面无弹幕评论（隐身，不留在线痕迹）；观看视角：录制浏览器画面（含弹幕/礼物特效），录制前自动把播放器切到最高画质 |
+| 直播录制 | 纯净模式：直取原画拉流地址，录制画面无弹幕评论；可选弹幕模式：录制原始流并将采集到的弹幕另存为 TXT |
 | 定时录制 | 支持定时开始；主播未开播时填主页链接/抖音号/分享文案，到点后自动等待开播并开录 |
 | 退出即收尾 | 无论正常结束、手动停止还是断流崩溃，已录片段自动转封装为 mp4；启动时自动抢救上次残留文件 |
 
@@ -18,7 +18,7 @@
 - **Python 3.9+**（Windows）
 - **playwright** — 浏览器自动化（首次运行 `playwright install chromium` 下载内核，走国内镜像加速）
 - **requests** — 拉流/下载
-- **imageio-ffmpeg** — 内置 ffmpeg，用于 flv→mp4 转封装与观看视角录屏（无需单独安装 ffmpeg）
+- **imageio-ffmpeg** — 内置 ffmpeg，用于 flv→mp4 转封装（无需单独安装 ffmpeg）
 - **PyInstaller**（仅打包时需要）
 
 首次双击 `打开爬虫界面.bat` 会自动检测并安装以上依赖。
@@ -37,7 +37,7 @@ python douyin_spider.py --account 123456 --limit 10          # 爬某个号的�
 python douyin_spider.py --search 关键词 --sort most_like      # 按点赞排序搜索
 python douyin_spider.py --comments <视频链接> --limit 500     # 抓评论
 python douyin_live_recorder.py --url https://live.douyin.com/xxxx --minutes 90
-python douyin_live_recorder.py --room 264311148089 --danmode view   # 观看视角
+python douyin_live_recorder.py --room 264311148089 --danmode clean_dm   # 原始流 + 弹幕 TXT
 ```
 
 - 主播没开播也能定时：`--url` 填主播主页链接/抖音号 + `--start 20:00`
@@ -53,5 +53,5 @@ cookies.txt         # 登录凭证，已 gitignore，切勿外传
 ## 注意
 
 - cookies 是你的登录凭证，等同于账号本体，**不要提交到仓库或发给别人**；建议使用小号
-- 观看视角录制期间不能移动/遮挡浏览器窗口，也不要在里面做任何操作，否则录屏会被破坏
+- `clean_dm` 模式会把弹幕记录保存为 TXT，视频仍为原始直播流
 - 平台前端结构可能随时改版导致功能失效，先跑 `--selftest` 排查

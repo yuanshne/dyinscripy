@@ -3,6 +3,7 @@ debug.log
 cookies.txt
 *.cookies.bak
 cookies.txt.bak
+browser_profile/
 
 # 下载输出
 downloads/
